@@ -1,6 +1,8 @@
 import axios from 'axios'
 
-export const BASE_URL = 'http://127.0.0.1:8765'
+const urlParams = new URLSearchParams(window.location.search)
+const port = urlParams.get('port') || '8765'
+export const BASE_URL = `http://127.0.0.1:${port}`
 
 const client = axios.create({
   baseURL: BASE_URL,

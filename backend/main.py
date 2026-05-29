@@ -763,5 +763,12 @@ async def websocket_pty(websocket: WebSocket, instance_id: str):
 
 
 if __name__ == "__main__":
+    import argparse
+
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8765)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8765)
+    cli = parser.parse_args()
+    uvicorn.run(app, host=cli.host, port=cli.port)

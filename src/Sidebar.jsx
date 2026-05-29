@@ -39,22 +39,6 @@ function SearchIcon() {
   )
 }
 
-function ChevronLeftIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
-      <path d="M9.5 4.5L6 8l3.5 3.5" stroke="currentColor" strokeWidth="1.25" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
-function ChevronRightIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
-      <path d="M6.5 4.5L10 8l-3.5 3.5" stroke="currentColor" strokeWidth="1.25" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
 function ChevronDownIcon({ className = '' }) {
   return (
     <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" className={className} aria-hidden>
@@ -207,26 +191,16 @@ export default function Sidebar({
   return (
     <>
     <aside className="box-border flex h-full w-[260px] flex-col bg-[#181818] text-[13px] text-[#cccccc]">
-      <div className="flex shrink-0 items-center justify-between px-2 pt-2 pb-1">
-        <div className="flex items-center gap-0.5">
-          <IconButton title="Hide sidebar" onClick={onToggleSidebar}>
-            <PanelLeftIcon />
-          </IconButton>
-          <IconButton
-            title="Search projects"
-            onClick={() => setSearchOpen((v) => !v)}
-          >
-            <SearchIcon />
-          </IconButton>
-        </div>
-        <div className="flex items-center gap-0.5">
-          <IconButton title="Back" disabled>
-            <ChevronLeftIcon />
-          </IconButton>
-          <IconButton title="Forward" disabled>
-            <ChevronRightIcon />
-          </IconButton>
-        </div>
+      <div className="flex shrink-0 items-center gap-0.5 px-2 pt-2 pb-1">
+        <IconButton title="Hide sidebar" onClick={onToggleSidebar}>
+          <PanelLeftIcon />
+        </IconButton>
+        <IconButton
+          title="Search projects"
+          onClick={() => setSearchOpen((v) => !v)}
+        >
+          <SearchIcon />
+        </IconButton>
       </div>
 
       {searchOpen ? (

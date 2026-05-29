@@ -47,7 +47,9 @@ export default function TerminalView({ instanceId, isActive }) {
     }
     safeFit()
 
-    const wsUrl = `ws://127.0.0.1:8765/ws/pty/${encodeURIComponent(instanceId)}`
+    const urlParams = new URLSearchParams(window.location.search)
+    const port = urlParams.get('port') || '8765'
+    const wsUrl = `ws://127.0.0.1:${port}/ws/pty/${encodeURIComponent(instanceId)}`
     const ws = new WebSocket(wsUrl)
     ws.binaryType = 'arraybuffer'
 
