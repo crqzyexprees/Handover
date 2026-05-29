@@ -92,6 +92,7 @@ class ProjectConfig(BaseModel):
     sandbox_mode: str = "docker"
     mem_limit: str = "2g"
     handoff_method: str = "git"
+    custom_env_vars: dict[str, str] | None = None
 
 
 class InstanceStart(BaseModel):
@@ -102,6 +103,10 @@ class InstanceStart(BaseModel):
     # Per-container memory cap (also caps swap). Docker mode only. Defaults to
     # 2g, enough headroom for the Node CLI TUIs (claude/codex) the user may run.
     mem_limit: str | None = None
+    # Extra environment variables injected into the container (Docker mode),
+    # e.g. {"OPENAI_BASE_URL": "https://openrouter.ai/api/v1", "OPENAI_API_KEY":
+    # "sk-..."} to point a CLI at OpenRouter or a custom proxy.
+    custom_env_vars: dict[str, str] | None = None
 
 
 class HandoffRequest(BaseModel):
@@ -138,6 +143,7 @@ def _default_project_config(project_id: str) -> dict:
         "sandbox_mode": "docker",
         "mem_limit": DEFAULT_MEM_LIMIT,
         "handoff_method": "git",
+        "custom_env_vars": {},
     }
 
 
@@ -284,6 +290,7 @@ async def save_project_config(project_id: str, body: ProjectConfig):
         "sandbox_mode": body.sandbox_mode,
         "mem_limit": body.mem_limit or DEFAULT_MEM_LIMIT,
         "handoff_method": body.handoff_method,
+        "custom_env_vars": body.custom_env_vars or {},
     }
     project_configs[project_id] = saved
     project["name"] = display_name
@@ -532,6 +539,7 @@ async def start_instance(body: InstanceStart):
             project_path=project["path"],
             instance_id=instance_id,
             mem_limit=mem_limit,
+            custom_env_vars=body.custom_env_vars,
         )
         instance["mem_limit"] = mem_limit
 

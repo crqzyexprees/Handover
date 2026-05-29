@@ -60,13 +60,18 @@ export async function startInstance(
   projectId,
   sandboxMode = 'docker',
   memLimit = '2g',
+  customEnvVars = null,
 ) {
   return request(async () => {
-    const res = await client.post('/api/instances/start', {
+    const body = {
       project_id: projectId,
       sandbox_mode: sandboxMode,
       mem_limit: memLimit,
-    })
+    }
+    if (customEnvVars != null && Object.keys(customEnvVars).length > 0) {
+      body.custom_env_vars = customEnvVars
+    }
+    const res = await client.post('/api/instances/start', body)
     return res.data
   })
 }

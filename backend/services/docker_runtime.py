@@ -112,13 +112,19 @@ class DockerRuntime:
         return nss_dir
 
     async def start_container(
-        self, project_path, instance_id, mem_limit=DEFAULT_MEM_LIMIT
+        self,
+        project_path,
+        instance_id,
+        mem_limit=DEFAULT_MEM_LIMIT,
+        custom_env_vars=None,
     ):
         """Launch a detached, TTY-enabled bash sandbox.
 
         The project directory is mounted at ``/workspace``. ``mem_limit`` caps
-        both RAM and swap (no swap headroom beyond RAM). Returns the new
-        container's ID.
+        both RAM and swap (no swap headroom beyond RAM). ``custom_env_vars`` is
+        an optional dict of extra environment variables (e.g. an OpenRouter /
+        custom-proxy base URL + key) merged into the container's environment.
+        Returns the new container's ID.
         """
         # Run as the host user so files created in /workspace are owned by
         # the host user instead of root.
@@ -133,6 +139,13 @@ class DockerRuntime:
             value = os.environ.get(key)
             if value:
                 environment[key] = value
+
+        # User-supplied vars (OpenRouter/custom-proxy config, etc.) are merged
+        # last so they override forwarded host keys on collision.
+        if custom_env_vars:
+            environment.update(
+                {str(k): str(v) for k, v in custom_env_vars.items()}
+            )
 
         # "z" relabels each bind mount for SELinux (Fedora/RHEL), without which
         # the container can't read/write the mount even when it owns the files.

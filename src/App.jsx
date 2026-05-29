@@ -17,6 +17,7 @@ const DEFAULT_PROJECT_CONFIG = {
   sandbox_mode: 'docker',
   mem_limit: '2g',
   handoff_method: 'git',
+  custom_env_vars: {},
 }
 
 function formatApiError(error) {
@@ -138,6 +139,7 @@ export default function App() {
     projectId,
     sandboxMode,
     memLimit,
+    customEnvVars,
   ) => {
     if (projectId == null) {
       pushToast('Select a project before opening a terminal', 'warn')
@@ -157,11 +159,17 @@ export default function App() {
       DEFAULT_PROJECT_CONFIG.sandbox_mode
     const resolvedMemLimit =
       memLimit ?? savedConfig.mem_limit ?? DEFAULT_PROJECT_CONFIG.mem_limit
+    const resolvedCustomEnvVars =
+      customEnvVars ??
+      (savedConfig.custom_env_vars && typeof savedConfig.custom_env_vars === 'object'
+        ? savedConfig.custom_env_vars
+        : DEFAULT_PROJECT_CONFIG.custom_env_vars)
 
     const { data, error } = await api.startInstance(
       projectId,
       resolvedSandboxMode,
       resolvedMemLimit,
+      resolvedCustomEnvVars,
     )
     if (error) {
       pushToast(`Could not start terminal: ${formatApiError(error)}`, 'error')
@@ -215,11 +223,14 @@ export default function App() {
         sandboxMode ?? savedConfig?.sandbox_mode ?? DEFAULT_PROJECT_CONFIG.sandbox_mode
       const resolvedMemLimit =
         savedConfig?.mem_limit ?? DEFAULT_PROJECT_CONFIG.mem_limit
+      const resolvedCustomEnvVars =
+        savedConfig?.custom_env_vars ?? DEFAULT_PROJECT_CONFIG.custom_env_vars
 
       return startInstanceForProject(
         focusedProjectId,
         resolvedSandboxMode,
         resolvedMemLimit,
+        resolvedCustomEnvVars,
       )
     },
     [focusedProjectId, projects, startInstanceForProject],
@@ -254,6 +265,7 @@ export default function App() {
         projectId,
         cfg.sandbox_mode ?? selectedProject?.sandbox_mode,
         cfg.mem_limit,
+        cfg.custom_env_vars ?? DEFAULT_PROJECT_CONFIG.custom_env_vars,
       )
     } else {
       const sourceInstances =
@@ -460,6 +472,10 @@ export default function App() {
       sandbox_mode: config?.sandbox_mode ?? DEFAULT_PROJECT_CONFIG.sandbox_mode,
       mem_limit: config?.mem_limit ?? DEFAULT_PROJECT_CONFIG.mem_limit,
       handoff_method: config?.handoff_method ?? DEFAULT_PROJECT_CONFIG.handoff_method,
+      custom_env_vars:
+        config?.custom_env_vars && typeof config.custom_env_vars === 'object'
+          ? config.custom_env_vars
+          : DEFAULT_PROJECT_CONFIG.custom_env_vars,
     }
 
     setProjects((prev) =>
