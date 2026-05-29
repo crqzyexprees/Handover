@@ -144,6 +144,45 @@ Other frontend scripts (from `package.json`): `npm run dev` (Vite only, in a bro
 
 ---
 
+## Building for Distribution
+
+`npm run build` runs `vite build` then [electron-builder](https://www.electron.build/) to produce Linux installers in `release/`:
+
+- `Handover-<version>.AppImage` — portable, self-contained
+- `handover-<version>.x86_64.rpm` — native Fedora/RHEL package
+
+The desktop app bundles a **standalone backend executable** built with PyInstaller. Build it first (the spec is committed at `backend/handover-backend.spec`):
+
+```bash
+cd backend
+source venv/bin/activate
+pyinstaller handover-backend.spec --noconfirm   # -> backend/dist/handover-backend
+```
+
+Then build the app from the repo root:
+
+```bash
+npm run build
+```
+
+### Fedora: `libxcrypt-compat` required for the RPM
+
+electron-builder builds the `.rpm` package with its bundled `fpm`, whose Ruby runtime depends on `libcrypt.so.1`. Modern Fedora ships `libcrypt.so.2` instead, so without the compat library the RPM build fails with:
+
+```
+ruby: error while loading shared libraries: libcrypt.so.1: cannot open shared object file
+```
+
+Install the compatibility package once (and `rpm-build` for `rpmbuild` if it isn't already present):
+
+```bash
+sudo dnf install libxcrypt-compat rpm-build
+```
+
+After that, `npm run build` produces the RPM with no extra steps. (The AppImage target does not use `fpm` and builds without this.)
+
+---
+
 ## How Handoffs Work
 
 A handoff captures the current state of a project so a **new** AI instance can pick up exactly where the previous one left off. When you trigger a handoff, Handover saves a checkpoint and then **injects a prompt directly into the new agent's terminal**, telling it where to find the context and what the overall goal is. Two methods are supported.
