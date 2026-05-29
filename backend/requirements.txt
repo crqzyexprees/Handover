@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+websockets
+docker
+pexpect
+GitPython
+pydantic
+aiofiles
+psutil

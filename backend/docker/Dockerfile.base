@@ -1,0 +1,36 @@
+# Base sandbox image: Ubuntu 22.04 with the common toolchain every CLI needs.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        git \
+        ca-certificates \
+        gnupg \
+    # NodeSource provides an up-to-date Node.js (bundles npm).
+    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pre-install the supported CLIs globally so they're on PATH in every sandbox.
+RUN npm install -g @anthropic-ai/claude-code @openai/codex
+
+# Cursor CLI (cursor-agent): the official installer drops it under the build
+# user's ~/.local (i.e. /root, mode 700). Relocate it to a shared path and
+# symlink onto PATH so the non-root sandbox user (host UID) can run it.
+RUN curl https://cursor.com/install -fsS | bash \
+    && cp -a /root/.local/share/cursor-agent /opt/cursor-agent \
+    && ln -sf /opt/cursor-agent/versions/*/cursor-agent /usr/local/bin/cursor-agent \
+    && chmod -R a+rX /opt/cursor-agent \
+    && rm -rf /root/.local
+
+# Writable HOME for the sandbox process, which runs as the host's (non-root)
+# UID. Host auth/config dirs are mounted in here read-only at runtime, and the
+# CLIs need a writable HOME for their own state. World-writable because the
+# runtime UID isn't known at build time; the container is ephemeral anyway.
+RUN mkdir -p /home/sandbox && chmod 777 /home/sandbox
+
+WORKDIR /workspace

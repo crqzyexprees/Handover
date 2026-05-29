@@ -1,0 +1,38 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Python backend
+backend/venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Local tooling config (per-user, not shared)
+.claude/settings.local.json
+**/.claude/settings.local.json
+
+# Handoff context history (generated per project at runtime)
+.handover/
+.ai-orchestrator/
