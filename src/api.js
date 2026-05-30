@@ -122,3 +122,12 @@ export async function focusInstance(id) {
     return res.data
   })
 }
+
+export async function getInstanceStats(instanceId) {
+  return request(async () => {
+    const res = await client.get(
+      `/api/instances/${encodeURIComponent(instanceId)}/stats`,
+    )
+    return res.data
+  })
+}

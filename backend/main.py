@@ -573,6 +573,25 @@ async def delete_instance(instance_id: str):
     return {"status": "ok"}
 
 
+@app.get("/api/instances/{instance_id}/stats")
+async def instance_stats(instance_id: str):
+    """Live CPU/memory usage for a docker-mode instance's container.
+
+    Native instances (no container) and paused/stopped containers report
+    zeros, so the frontend can poll this uniformly for any instance.
+    """
+    instance = instances.get(instance_id)
+    if instance is None:
+        raise HTTPException(status_code=404, detail="Instance not found")
+
+    zeros = {"mem_used_mb": 0.0, "mem_limit_mb": 0.0, "cpu_percent": 0.0}
+    container_id = instance.get("container_id")
+    if not container_id:
+        return zeros
+
+    return await get_docker_runtime().get_container_stats(container_id)
+
+
 @app.post("/api/instances/{instance_id}/focus")
 async def focus_instance(instance_id: str):
     if instance_id not in instances:

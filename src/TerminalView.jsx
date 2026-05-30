@@ -1,14 +1,20 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { WebglAddon } from '@xterm/addon-webgl'
 import '@xterm/xterm/css/xterm.css'
+import { getInstanceStats } from './api'
 
 const ANSI_GREEN = '\x1b[32m'
 const ANSI_RED = '\x1b[31m'
 const ANSI_RESET = '\x1b[0m'
 
+const STATS_POLL_MS = 5000
+
 export default function TerminalView({ instanceId, isActive }) {
   const containerRef = useRef(null)
+  const termRef = useRef(null)
+  const [stats, setStats] = useState(null)
 
   useEffect(() => {
     if (instanceId == null || instanceId === '') {
@@ -36,6 +42,19 @@ export default function TerminalView({ instanceId, isActive }) {
     const fitAddon = new FitAddon()
     term.loadAddon(fitAddon)
     term.open(container)
+    termRef.current = term
+
+    let webglAddon = null
+    try {
+      webglAddon = new WebglAddon()
+      webglAddon.onContextLoss(() => {
+        webglAddon?.dispose()
+        webglAddon = null
+      })
+      term.loadAddon(webglAddon)
+    } catch {
+      webglAddon = null
+    }
 
     const safeFit = () => {
       if (!alive) return
@@ -97,6 +116,14 @@ export default function TerminalView({ instanceId, isActive }) {
       alive = false
       resizeObserver.disconnect()
       dataSub.dispose()
+      if (webglAddon) {
+        try {
+          webglAddon.dispose()
+        } catch {
+          // Already disposed after context loss
+        }
+      }
+      termRef.current = null
       term.dispose()
       if (
         ws.readyState === WebSocket.OPEN ||
@@ -106,6 +133,36 @@ export default function TerminalView({ instanceId, isActive }) {
       }
     }
   }, [instanceId])
+
+  useEffect(() => {
+    if (instanceId == null || instanceId === '') {
+      setStats(null)
+      return
+    }
+
+    let cancelled = false
+    setStats(null)
+
+    const fetchStats = async () => {
+      const { data, error } = await getInstanceStats(instanceId)
+      if (!cancelled && data && !error) {
+        setStats(data)
+      }
+    }
+
+    fetchStats()
+    const intervalId = setInterval(fetchStats, STATS_POLL_MS)
+
+    return () => {
+      cancelled = true
+      clearInterval(intervalId)
+    }
+  }, [instanceId])
+
+  const memOverLimit =
+    stats != null &&
+    stats.mem_limit_mb > 0 &&
+    stats.mem_used_mb / stats.mem_limit_mb > 0.8
 
   return (
     <div
@@ -118,7 +175,32 @@ export default function TerminalView({ instanceId, isActive }) {
       className="min-h-0 min-w-0 flex-1"
     >
       <div className="box-border flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-[#1e1e1e]">
-        <div ref={containerRef} className="min-h-0 min-w-0 flex-1" />
+        <div className="relative min-h-0 min-w-0 flex-1">
+          <div ref={containerRef} className="h-full min-h-0 min-w-0" />
+          <div className="pointer-events-none absolute right-2 bottom-2 z-10">
+            <div className="flex items-center gap-1.5 rounded bg-[#1e1e1e]/80 px-2 py-1 text-[10px]">
+              {stats != null && (
+                <span
+                  className={
+                    memOverLimit ? 'text-[#ef4444]' : 'text-[#808080]'
+                  }
+                >
+                  {stats.mem_used_mb}MB / {stats.mem_limit_mb}MB |{' '}
+                  {stats.cpu_percent}% CPU
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={() => termRef.current?.clear()}
+                className="pointer-events-auto cursor-pointer border-0 bg-transparent p-0 text-[#808080] leading-none hover:text-[#a0a0a0]"
+                title="Clear terminal"
+                aria-label="Clear terminal"
+              >
+                🗑️
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   )

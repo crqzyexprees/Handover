@@ -64,6 +64,51 @@ _COPY_CONFIG_CMD = (
 DEFAULT_MEM_LIMIT = "2g"
 NANO_CPUS = 1_000_000_000  # 1.0 CPU
 
+_BYTES_PER_MB = 1024 * 1024
+
+
+def _cpu_percent(stats: dict) -> float:
+    """CPU usage percent from a Docker stats snapshot.
+
+    Computed the same way ``docker stats`` does: the container's CPU-time
+    delta over the system CPU-time delta, scaled by the number of CPUs. With
+    100% meaning one fully-used core (so a 4-core host can report up to 400%).
+    Returns 0.0 if either delta is non-positive (e.g. the first sample after
+    start, when there's no prior reading to diff against).
+    """
+    cpu = stats.get("cpu_stats", {})
+    precpu = stats.get("precpu_stats", {})
+    cpu_usage = cpu.get("cpu_usage", {})
+    precpu_usage = precpu.get("cpu_usage", {})
+
+    cpu_delta = cpu_usage.get("total_usage", 0) - precpu_usage.get("total_usage", 0)
+    system_delta = cpu.get("system_cpu_usage", 0) - precpu.get("system_cpu_usage", 0)
+    if cpu_delta <= 0 or system_delta <= 0:
+        return 0.0
+
+    # online_cpus is absent on older daemons; fall back to the per-CPU array.
+    online_cpus = cpu.get("online_cpus") or len(cpu_usage.get("percpu_usage") or [])
+    if not online_cpus:
+        return 0.0
+
+    return round((cpu_delta / system_delta) * online_cpus * 100.0, 1)
+
+
+def _mem_used_mb(stats: dict) -> float:
+    """Memory in use (MB), with page cache excluded to match ``docker stats``."""
+    mem = stats.get("memory_stats", {})
+    usage = mem.get("usage", 0)
+    # Newer cgroup v2 reports cache under "inactive_file"; v1 under "cache".
+    detail = mem.get("stats", {})
+    cache = detail.get("inactive_file", detail.get("cache", 0))
+    return round(max(usage - cache, 0) / _BYTES_PER_MB, 1)
+
+
+def _mem_limit_mb(stats: dict) -> float:
+    """Container memory limit (MB)."""
+    limit = stats.get("memory_stats", {}).get("limit", 0)
+    return round(limit / _BYTES_PER_MB, 1)
+
 
 class DockerRuntime:
     """Manages the lifecycle of per-instance sandbox containers.
@@ -268,6 +313,42 @@ class DockerRuntime:
                 pass
 
         await asyncio.to_thread(_unpause)
+
+    async def get_container_stats(self, container_id):
+        """Return a single live CPU/memory snapshot for a container.
+
+        Shape: ``{"mem_used_mb": float, "mem_limit_mb": float,
+        "cpu_percent": float}``. Returns all-zeros when the container is
+        missing, not running, or paused (a paused container reports no CPU
+        delta and its stats are meaningless to display as "live" usage).
+        """
+        zeros = {"mem_used_mb": 0.0, "mem_limit_mb": 0.0, "cpu_percent": 0.0}
+
+        def _stats():
+            try:
+                container = self.client.containers.get(container_id)
+            except docker.errors.NotFound:
+                return zeros
+            # `status` is "running", "paused", "exited", ... Only a running
+            # (unpaused) container has meaningful live usage.
+            if container.status != "running":
+                return zeros
+
+            # stream=False returns one snapshot carrying both the current
+            # (`cpu_stats`) and previous (`precpu_stats`) samples, so the CPU
+            # delta can be computed from a single call.
+            try:
+                stats = container.stats(stream=False)
+            except docker.errors.APIError:
+                return zeros
+
+            return {
+                "mem_used_mb": _mem_used_mb(stats),
+                "mem_limit_mb": _mem_limit_mb(stats),
+                "cpu_percent": _cpu_percent(stats),
+            }
+
+        return await asyncio.to_thread(_stats)
 
     async def cleanup_orphans(self):
         """Force-remove every container we previously created.
