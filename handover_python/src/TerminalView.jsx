@@ -14,7 +14,7 @@ const STATS_POLL_MS = 5000
 export default function TerminalView({ instanceId, isActive }) {
   const containerRef = useRef(null)
   const termRef = useRef(null)
-  const [stats, setStats] = useState(null)
+  const [statsState, setStatsState] = useState(null)
 
   useEffect(() => {
     if (instanceId == null || instanceId === '') {
@@ -136,17 +136,15 @@ export default function TerminalView({ instanceId, isActive }) {
 
   useEffect(() => {
     if (instanceId == null || instanceId === '') {
-      setStats(null)
       return
     }
 
     let cancelled = false
-    setStats(null)
 
     const fetchStats = async () => {
       const { data, error } = await getInstanceStats(instanceId)
       if (!cancelled && data && !error) {
-        setStats(data)
+        setStatsState({ instanceId, data })
       }
     }
 
@@ -158,6 +156,8 @@ export default function TerminalView({ instanceId, isActive }) {
       clearInterval(intervalId)
     }
   }, [instanceId])
+
+  const stats = statsState?.instanceId === instanceId ? statsState.data : null
 
   const memOverLimit =
     stats != null &&

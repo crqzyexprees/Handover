@@ -7,12 +7,7 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
+# Editor
 .vscode/*
 !.vscode/extensions.json
 .idea
@@ -23,21 +18,42 @@ dist-ssr
 *.sln
 *.sw?
 
-# Python backend
+# Python stack (handover_python)
+handover_python/node_modules
+handover_python/dist
+handover_python/dist-ssr
+handover_python/*.local
+handover_python/release
+handover_python/backend/venv/
+handover_python/backend/build/
+handover_python/backend/dist/
+handover_python/**/__pycache__/
+handover_python/**/*.py[cod]
+
+# Rust stack (handover_rust)
+handover_rust/target/
+
+# Legacy root paths (before reorganize.py)
+node_modules
+dist
+dist-ssr
+*.local
+release
 backend/venv/
-venv/
+backend/build/
+backend/dist/
 __pycache__/
 *.py[cod]
 
-# Build artifacts (regenerable: vite dist/, PyInstaller, electron-builder)
-release/
-backend/build/
-backend/dist/
-
-# Local tooling config (per-user, not shared)
+# Local tooling
 .claude/settings.local.json
 **/.claude/settings.local.json
 
-# Handoff context history (generated per project at runtime)
+# Runtime handoff data inside user projects
 .handover/
 .ai-orchestrator/
+
+# Migration helpers
+_reorganize.sh
+_reorganize.done
+_shell_test.txt

@@ -1,0 +1,29 @@
+[package]
+name = "handover-rust"
+version = "0.1.0"
+edition = "2021"
+description = "Handover backend — REST API, WebSocket PTY, Docker sandboxes"
+
+[[bin]]
+name = "handover-backend"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws", "macros"] }
+bollard = "0.18"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+git2 = "0.19"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.33"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+users = "0.11"
+uuid = { version = "1", features = ["v4"] }
