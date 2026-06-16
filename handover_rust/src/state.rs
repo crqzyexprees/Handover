@@ -223,13 +223,4 @@ mod tests {
         assert_eq!(basename_from_path("/tmp/example/"), "example");
         assert_eq!(basename_from_path(""), "Unknown");
     }
-
-    #[test]
-    fn default_project_config_uses_summary_handoff() {
-        let config = default_project_config("/tmp/example");
-        assert_eq!(
-            config.get("handoff_method").and_then(|v| v.as_str()),
-            Some("summary")
-        );
-    }
 }

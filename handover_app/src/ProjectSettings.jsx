@@ -266,23 +266,6 @@ export default function ProjectSettings({
                 <input
                   type="radio"
                   name="handoff_method"
-                  checked={config.handoff_method === 'git'}
-                  onChange={() =>
-                    setConfig((prev) => ({ ...prev, handoff_method: 'git' }))
-                  }
-                />
-                Git Commit
-              </label>
-              <p className="mt-1 pl-5 text-xs text-[#808080]">
-                Creates a version-history checkpoint for team handoffs or review, then
-                prompts the receiving terminal.
-              </p>
-            </div>
-            <div>
-              <label className="flex items-center gap-2 text-sm">
-                <input
-                  type="radio"
-                  name="handoff_method"
                   checked={config.handoff_method === 'summary'}
                   onChange={() =>
                     setConfig((prev) => ({ ...prev, handoff_method: 'summary' }))
@@ -291,9 +274,26 @@ export default function ProjectSettings({
                 Summary File
               </label>
               <p className="mt-1 pl-5 text-xs text-[#808080]">
-                Default for day-to-day AI handoffs. Prompts the source terminal to
-                write `.handover/handoffs/latest.md`, waits for it, then directs the
-                target to read it.
+                Default for AI handoffs. Source AI writes `.handover/handoffs/latest.md`;
+                backend waits up to 60s for the file, then prompts the target. Both
+                terminals must be connected.
+              </p>
+            </div>
+            <div>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="radio"
+                  name="handoff_method"
+                  checked={config.handoff_method === 'git'}
+                  onChange={() =>
+                    setConfig((prev) => ({ ...prev, handoff_method: 'git' }))
+                  }
+                />
+                Git Commit
+              </label>
+              <p className="mt-1 pl-5 text-xs text-[#808080]">
+                Team checkpoint for switching teams on the same repo. Commits changes,
+                then prompts the receiving terminal only.
               </p>
             </div>
           </section>

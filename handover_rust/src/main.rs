@@ -7,7 +7,6 @@ mod state;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::extract::{Path, State, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -28,8 +27,6 @@ use crate::state::{
     basename_from_path, default_project_config, monotonic_secs, project_container_ids, AppState,
     DEFAULT_MEM_LIMIT, HANDOFF_METHODS, SANDBOX_MODES,
 };
-
-const SUMMARY_HANDOFF_TIMEOUT_SECS: u64 = 60;
 
 #[derive(Parser)]
 #[command(name = "handover-backend")]
@@ -135,7 +132,7 @@ struct ProjectConfigBody {
     sandbox_mode: String,
     #[serde(default = "default_mem")]
     mem_limit: String,
-    #[serde(default = "default_summary")]
+    #[serde(default = "default_handoff_method")]
     handoff_method: String,
     custom_env_vars: Option<HashMap<String, String>>,
 }
@@ -143,7 +140,7 @@ struct ProjectConfigBody {
 fn default_mem() -> String {
     DEFAULT_MEM_LIMIT.into()
 }
-fn default_summary() -> String {
+fn default_handoff_method() -> String {
     "summary".into()
 }
 
@@ -614,10 +611,6 @@ async fn send_prompt_to_instance(state: &AppState, instance_id: &str, prompt: &s
     false
 }
 
-async fn has_pty_session(state: &AppState, instance_id: &str) -> bool {
-    state.pty_sessions.read().await.contains_key(instance_id)
-}
-
 async fn execute_handoff(
     State(ctx): State<ServerCtx>,
     Json(body): Json<HandoffRequest>,
@@ -673,13 +666,6 @@ async fn execute_handoff(
         .and_then(|v| v.as_str())
         .ok_or_else(|| api_err(StatusCode::INTERNAL_SERVER_ERROR, "project path missing"))?;
 
-    if !has_pty_session(&ctx.state, &body.to_instance_id).await {
-        return Err(api_err(
-            StatusCode::BAD_REQUEST,
-            "to_instance does not have an active terminal session",
-        ));
-    }
-
     let mut handoff_message = "Handoff complete".to_string();
     let injection_prompt = if body.method == "git" {
         let outcome = match handoff::git_handoff(
@@ -711,45 +697,46 @@ async fn execute_handoff(
         }
         .replace("{task}", &body.task_description)
     } else {
-        if !has_pty_session(&ctx.state, &body.from_instance_id).await {
-            return Err(api_err(
-                StatusCode::BAD_REQUEST,
-                "from_instance does not have an active terminal session",
-            ));
-        }
-
         let previous_snapshot = handoff::latest_handoff_snapshot(project_path);
         let source_prompt = format!(
-            "Create a handoff file for the next AI now. Run `mkdir -p .handover/handoffs`, then write concise Markdown to `.handover/handoffs/latest.md`. Also create the next numbered history file under `.handover/handoffs/` as `handoff_NNN.md` using highest existing number + 1, with the same content. Include: current goal, project context, files changed, commands run, tests/results, decisions made, blockers, and exact next steps. Overall goal: {}. After writing both files, stop and wait.",
+            "Create a handoff file for the next AI now. Write concise Markdown to '.handover/handoffs/latest.md' and also create the next numbered history file under '.handover/handoffs/' as 'handoff_NNN.md' with the same content. Include: current goal, project context, files changed, commands run, tests/results, decisions made, blockers, and exact next steps. Overall goal: {}. After writing the files, stop and wait.",
             body.task_description
         );
-        let source_sent =
-            send_prompt_to_instance(&ctx.state, &body.from_instance_id, &source_prompt).await;
-        if !source_sent {
+        if !send_prompt_to_instance(&ctx.state, &body.from_instance_id, &source_prompt).await {
             return Err(api_err(
                 StatusCode::BAD_REQUEST,
                 "from_instance does not have an active terminal session",
             ));
         }
 
-        let handoff_ready = handoff::wait_for_latest_handoff(
+        let ready = handoff::wait_for_latest_handoff(
             project_path,
             previous_snapshot,
-            Duration::from_secs(SUMMARY_HANDOFF_TIMEOUT_SECS),
+            handoff::HANDOFF_FILE_WAIT_TIMEOUT,
         )
         .await
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| {
+            api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed while waiting for handoff file: {e}"),
+            )
+        })?;
 
-        if !handoff_ready {
-            handoff::summary_handoff(project_path, &body.task_description)
-                .await
-                .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            return Err(api_err(
-                StatusCode::GATEWAY_TIMEOUT,
-                format!(
-                    "Timed out waiting for the source AI to create .handover/handoffs/latest.md after {SUMMARY_HANDOFF_TIMEOUT_SECS}s. A fallback handoff file was created, but the target AI was not prompted."
-                ),
-            ));
+        if !ready {
+            if let Err(e) = handoff::summary_handoff(project_path, &body.task_description).await {
+                return Err(api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to write fallback handoff file: {e}"),
+                ));
+            }
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "status": "error",
+                    "message": "Source AI did not create a handoff file within 60 seconds. A fallback handoff file was written with only the goal you provided; review it before handing off manually."
+                })),
+            )
+                .into_response());
         }
 
         handoff_message =

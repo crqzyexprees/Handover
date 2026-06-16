@@ -72,14 +72,14 @@ export default function App() {
   const [ptyConnections, setPtyConnections] = useState({})
   const restoreToastShownRef = useRef(false)
 
-  const pushToast = useCallback((message, variant = 'error') => {
+  const pushToast = useCallback((message, variant = 'error', durationMs = 5000) => {
     const id =
       globalThis.crypto?.randomUUID?.() ??
       `${Date.now()}-${Math.random().toString(16).slice(2)}`
     setToasts((prev) => [...prev, { id, message, variant }])
     window.setTimeout(() => {
       setToasts((prev) => prev.filter((x) => x.id !== id))
-    }, 5000)
+    }, durationMs)
   }, [])
 
   const handlePtyConnectionChange = useCallback((instanceId, status) => {
@@ -484,10 +484,11 @@ export default function App() {
       }
       const result = api.parseHandoffResult(data)
       if (!result.ok) {
-        pushToast(`Could not execute handover: ${result.message}`, 'error')
+        pushToast(result.message, 'error', 9000)
         return false
       }
-      pushToast(result.message ?? 'Handover executed', 'success')
+      const isSummarySuccess = result.message.includes('wrote the handoff file')
+      pushToast(result.message ?? 'Handover complete', 'success', isSummarySuccess ? 7000 : 5000)
       return true
     },
     [pushToast],

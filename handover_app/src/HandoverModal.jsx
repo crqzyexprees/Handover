@@ -2,9 +2,9 @@ import { useMemo, useState } from 'react'
 import { getInstanceId } from './projectUtils.js'
 
 const METHOD_HELP = {
-  git: 'Creates a version-history checkpoint for team handoffs or review, then prompts the receiving terminal.',
+  git: 'Team checkpoint: commits code changes, then prompts the receiving terminal. Use when switching teams on the same repo. Requires only the receiving terminal to be connected.',
   summary:
-    'Default for day-to-day AI handoffs. Prompts the source terminal to write `.handover/handoffs/latest.md`, waits for it, then directs the target to read it.',
+    'Default for AI handoffs. Prompts the source terminal to write `.handover/handoffs/latest.md`, waits up to 60s for the file to finish writing, then prompts the target to read it. Both terminals must stay connected.',
 }
 
 function connectionLabel(status) {
@@ -187,22 +187,6 @@ export default function HandoverModal({
               <input
                 type="radio"
                 name="handoverMethod"
-                value="git"
-                checked={method === 'git'}
-                onChange={(e) => setMethod(e.target.value)}
-                className="mt-0.5"
-              />
-              <span>
-                <span className="font-medium">Git Commit</span>
-                <span className="mt-0.5 block text-xs leading-relaxed text-[#808080]">
-                  {METHOD_HELP.git}
-                </span>
-              </span>
-            </label>
-            <label className="flex cursor-pointer items-start gap-2">
-              <input
-                type="radio"
-                name="handoverMethod"
                 value="summary"
                 checked={method === 'summary'}
                 onChange={(e) => setMethod(e.target.value)}
@@ -212,6 +196,22 @@ export default function HandoverModal({
                 <span className="font-medium">Summary File</span>
                 <span className="mt-0.5 block text-xs leading-relaxed text-[#808080]">
                   {METHOD_HELP.summary}
+                </span>
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="handoverMethod"
+                value="git"
+                checked={method === 'git'}
+                onChange={(e) => setMethod(e.target.value)}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="font-medium">Git Commit</span>
+                <span className="mt-0.5 block text-xs leading-relaxed text-[#808080]">
+                  {METHOD_HELP.git}
                 </span>
               </span>
             </label>

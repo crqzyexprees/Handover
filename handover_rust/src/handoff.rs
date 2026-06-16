@@ -82,6 +82,10 @@ pub fn latest_handoff_snapshot(project_path: &str) -> Option<HandoffFileSnapshot
     })
 }
 
+pub const HANDOFF_FILE_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const HANDOFF_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const HANDOFF_STABLE_POLLS: u32 = 2;
+
 pub async fn wait_for_latest_handoff(
     project_path: &str,
     previous: Option<HandoffFileSnapshot>,
@@ -89,8 +93,14 @@ pub async fn wait_for_latest_handoff(
 ) -> Result<bool> {
     let latest = latest_handoff_path(project_path);
     let deadline = tokio::time::Instant::now() + timeout;
+    let mut stable_polls = 0u32;
+    let mut last_seen_len: Option<u64> = None;
 
     loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+
         if let Ok(metadata) = fs::metadata(&latest).await {
             let current = HandoffFileSnapshot {
                 modified: metadata.modified().ok(),
@@ -106,15 +116,30 @@ pub async fn wait_for_latest_handoff(
                             .is_some_and(|(current, previous)| current > previous)
                 }
             };
-            if is_new_or_updated && metadata.len() > 0 {
-                return Ok(true);
+
+            if is_new_or_updated && current.len > 0 {
+                match last_seen_len {
+                    Some(len) if len == current.len => {
+                        stable_polls += 1;
+                        if stable_polls >= HANDOFF_STABLE_POLLS {
+                            return Ok(true);
+                        }
+                    }
+                    _ => {
+                        stable_polls = 0;
+                        last_seen_len = Some(current.len);
+                    }
+                }
+            } else {
+                stable_polls = 0;
+                last_seen_len = None;
             }
+        } else {
+            stable_polls = 0;
+            last_seen_len = None;
         }
 
-        if tokio::time::Instant::now() >= deadline {
-            return Ok(false);
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        tokio::time::sleep(HANDOFF_POLL_INTERVAL).await;
     }
 }
 
@@ -170,11 +195,38 @@ mod tests {
             std::fs::write(writer_path, "ready").unwrap();
         });
 
-        let ready = wait_for_latest_handoff(&project_path, None, Duration::from_secs(2))
+        let ready = wait_for_latest_handoff(&project_path, None, Duration::from_secs(5))
             .await
             .unwrap();
 
         assert!(ready);
+    }
+
+    #[tokio::test]
+    async fn wait_for_latest_handoff_waits_for_stable_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().to_str().unwrap().to_string();
+        let writer_path = latest_handoff_path(&project_path);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            std::fs::create_dir_all(writer_path.parent().unwrap()).unwrap();
+            std::fs::write(&writer_path, "partial").unwrap();
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            std::fs::write(&writer_path, "partial and done").unwrap();
+        });
+
+        let ready = wait_for_latest_handoff(
+            &project_path,
+            None,
+            Duration::from_secs(6),
+        )
+        .await
+        .unwrap();
+
+        assert!(ready);
+        let content = std::fs::read_to_string(latest_handoff_path(&project_path)).unwrap();
+        assert_eq!(content, "partial and done");
     }
 
     #[tokio::test]
