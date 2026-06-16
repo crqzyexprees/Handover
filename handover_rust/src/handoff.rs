@@ -1,8 +1,11 @@
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+#[cfg(test)]
 use chrono::Utc;
 use git2::{Repository, Signature};
+#[cfg(test)]
 use tokio::fs;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -41,6 +44,7 @@ pub async fn git_handoff(project_path: &str, summary_text: &str) -> Result<GitHa
     Ok(outcome)
 }
 
+#[cfg(test)]
 fn next_handoff_path(handoffs_dir: &Path) -> PathBuf {
     let mut highest = 0u32;
     if let Ok(mut entries) = std::fs::read_dir(handoffs_dir) {
@@ -59,6 +63,7 @@ fn next_handoff_path(handoffs_dir: &Path) -> PathBuf {
     handoffs_dir.join(format!("handoff_{:03}.md", highest + 1))
 }
 
+#[cfg(test)]
 pub async fn summary_handoff(project_path: &str, task_description: &str) -> Result<()> {
     let handoffs_dir = Path::new(project_path).join(".handover/handoffs");
     fs::create_dir_all(&handoffs_dir).await?;

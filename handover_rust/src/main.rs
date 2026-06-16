@@ -599,6 +599,18 @@ async fn focus_instance(
     Ok(Json(json!({ "status": "ok" })))
 }
 
+async fn send_prompt_to_instance(state: &AppState, instance_id: &str, prompt: &str) -> bool {
+    if let Some(session) = state.pty_sessions.read().await.get(instance_id) {
+        let _ = session.input_tx.send(b"\n".to_vec());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let mut line = prompt.as_bytes().to_vec();
+        line.push(b'\n');
+        let _ = session.input_tx.send(line);
+        return true;
+    }
+    false
+}
+
 async fn execute_handoff(
     State(ctx): State<ServerCtx>,
     Json(body): Json<HandoffRequest>,
@@ -685,27 +697,32 @@ async fn execute_handoff(
         }
         .replace("{task}", &body.task_description)
     } else {
-        handoff::summary_handoff(project_path, &body.task_description)
-            .await
-            .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        handoff_message =
+            "Source AI was asked to write the handoff file; target AI was directed to read it"
+                .to_string();
+        let source_prompt = format!(
+            "Create a handoff file for the next AI now. Write concise Markdown to '.handover/handoffs/latest.md' and also create the next numbered history file under '.handover/handoffs/' as 'handoff_NNN.md' with the same content. Include: current goal, project context, files changed, commands run, tests/results, decisions made, blockers, and exact next steps. Overall goal: {}. After writing the files, stop and wait.",
+            body.task_description
+        );
+        let source_sent =
+            send_prompt_to_instance(&ctx.state, &body.from_instance_id, &source_prompt).await;
+        if !source_sent {
+            return Err(api_err(
+                StatusCode::BAD_REQUEST,
+                "from_instance does not have an active terminal session",
+            ));
+        }
         format!(
-            "You are taking over this project. Read the file '.handover/handoffs/latest.md' to see the current state. Your overall goal is: {}. Continue from there.",
+            "You are taking over this project. Read '.handover/handoffs/latest.md' for the handoff from the previous AI. If the file is not ready yet, wait briefly and check again. Your overall goal is: {}. Continue from that file.",
             body.task_description
         )
     };
 
-    if let Some(session) = ctx
-        .state
-        .pty_sessions
-        .read()
-        .await
-        .get(&body.to_instance_id)
-    {
-        let _ = session.input_tx.send(b"\n".to_vec());
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let mut line = injection_prompt.into_bytes();
-        line.push(b'\n');
-        let _ = session.input_tx.send(line);
+    if !send_prompt_to_instance(&ctx.state, &body.to_instance_id, &injection_prompt).await {
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            "to_instance does not have an active terminal session",
+        ));
     }
 
     Ok(Json(json!({ "status": "ok", "message": handoff_message })).into_response())

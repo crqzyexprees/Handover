@@ -455,7 +455,7 @@ export default function App() {
         return
       }
       console.log('Handover executed', data ?? payload)
-      pushToast('Handover executed', 'info')
+      pushToast(data?.message ?? 'Handover executed', 'info')
     },
     [pushToast],
   )

@@ -76,13 +76,13 @@ export default function HandoverModal({
               htmlFor="handover-task"
               className="block text-xs font-semibold uppercase tracking-wide text-[#808080]"
             >
-              What was the original goal/task?
+              Goal for the next AI
             </label>
             <textarea
               id="handover-task"
               value={taskDescription}
               onChange={(e) => setTaskDescription(e.target.value)}
-              placeholder="e.g., Build a Python FastAPI server for a todo app"
+              placeholder="e.g., finish the Rust backend persistence work"
               rows={3}
               className="mt-1 w-full resize-y rounded border border-[#333333] bg-[#1e1e1e] px-2 py-1.5 text-sm text-[#cccccc] placeholder:text-[#808080] focus:border-[#3794ff] focus:outline-none"
             />
@@ -154,7 +154,7 @@ export default function HandoverModal({
                 checked={method === 'summary'}
                 onChange={(e) => setMethod(e.target.value)}
               />
-              Summary File (.handover/handoffs/)
+              AI-written Summary File
             </label>
           </div>
         </fieldset>
