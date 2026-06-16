@@ -140,7 +140,7 @@ pub fn default_project_config(path: &str) -> Value {
         "project_name": basename_from_path(path),
         "sandbox_mode": "docker",
         "mem_limit": DEFAULT_MEM_LIMIT,
-        "handoff_method": "git",
+        "handoff_method": "summary",
         "custom_env_vars": {},
     })
 }
@@ -222,5 +222,14 @@ mod tests {
     fn basename_handles_empty_and_trailing_slashes() {
         assert_eq!(basename_from_path("/tmp/example/"), "example");
         assert_eq!(basename_from_path(""), "Unknown");
+    }
+
+    #[test]
+    fn default_project_config_uses_summary_handoff() {
+        let config = default_project_config("/tmp/example");
+        assert_eq!(
+            config.get("handoff_method").and_then(|v| v.as_str()),
+            Some("summary")
+        );
     }
 }

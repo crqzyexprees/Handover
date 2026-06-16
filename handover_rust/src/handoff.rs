@@ -1,12 +1,16 @@
-#[cfg(test)]
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-#[cfg(test)]
 use chrono::Utc;
 use git2::{Repository, Signature};
-#[cfg(test)]
 use tokio::fs;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct HandoffFileSnapshot {
+    modified: Option<SystemTime>,
+    len: u64,
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum GitHandoffOutcome {
@@ -44,7 +48,6 @@ pub async fn git_handoff(project_path: &str, summary_text: &str) -> Result<GitHa
     Ok(outcome)
 }
 
-#[cfg(test)]
 fn next_handoff_path(handoffs_dir: &Path) -> PathBuf {
     let mut highest = 0u32;
     if let Ok(mut entries) = std::fs::read_dir(handoffs_dir) {
@@ -63,14 +66,66 @@ fn next_handoff_path(handoffs_dir: &Path) -> PathBuf {
     handoffs_dir.join(format!("handoff_{:03}.md", highest + 1))
 }
 
-#[cfg(test)]
+fn handoffs_dir(project_path: &str) -> PathBuf {
+    Path::new(project_path).join(".handover/handoffs")
+}
+
+pub fn latest_handoff_path(project_path: &str) -> PathBuf {
+    handoffs_dir(project_path).join("latest.md")
+}
+
+pub fn latest_handoff_snapshot(project_path: &str) -> Option<HandoffFileSnapshot> {
+    let metadata = std::fs::metadata(latest_handoff_path(project_path)).ok()?;
+    Some(HandoffFileSnapshot {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
+}
+
+pub async fn wait_for_latest_handoff(
+    project_path: &str,
+    previous: Option<HandoffFileSnapshot>,
+    timeout: Duration,
+) -> Result<bool> {
+    let latest = latest_handoff_path(project_path);
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        if let Ok(metadata) = fs::metadata(&latest).await {
+            let current = HandoffFileSnapshot {
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+            };
+            let is_new_or_updated = match previous {
+                None => true,
+                Some(previous) => {
+                    current.len != previous.len
+                        || current
+                            .modified
+                            .zip(previous.modified)
+                            .is_some_and(|(current, previous)| current > previous)
+                }
+            };
+            if is_new_or_updated && metadata.len() > 0 {
+                return Ok(true);
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 pub async fn summary_handoff(project_path: &str, task_description: &str) -> Result<()> {
-    let handoffs_dir = Path::new(project_path).join(".handover/handoffs");
+    let handoffs_dir = handoffs_dir(project_path);
     fs::create_dir_all(&handoffs_dir).await?;
 
     let timestamp = Utc::now().to_rfc3339();
-    let content =
-        format!("# AI Handoff\n\n- Timestamp: {timestamp}\n\n## Task\n\n{task_description}\n");
+    let content = format!(
+        "# AI Handoff\n\n- Timestamp: {timestamp}\n- Source: Handover fallback\n\n## Goal\n\n{task_description}\n\n## Status\n\nThe source AI did not create `.handover/handoffs/latest.md` before the timeout. This fallback file contains only the user-provided goal; inspect the project and terminal history before continuing.\n"
+    );
 
     let numbered = next_handoff_path(&handoffs_dir);
     let latest = handoffs_dir.join("latest.md");
@@ -100,6 +155,45 @@ mod tests {
         assert!(handoffs.join("handoff_002.md").is_file());
         let latest = std::fs::read_to_string(handoffs.join("latest.md")).unwrap();
         assert!(latest.contains("second task"));
+        assert!(latest.contains("Handover fallback"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_latest_handoff_detects_created_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().to_str().unwrap().to_string();
+        let writer_path = latest_handoff_path(&project_path);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            std::fs::create_dir_all(writer_path.parent().unwrap()).unwrap();
+            std::fs::write(writer_path, "ready").unwrap();
+        });
+
+        let ready = wait_for_latest_handoff(&project_path, None, Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert!(ready);
+    }
+
+    #[tokio::test]
+    async fn wait_for_latest_handoff_times_out_when_file_is_not_updated() {
+        let dir = tempfile::tempdir().unwrap();
+        summary_handoff(dir.path().to_str().unwrap(), "existing")
+            .await
+            .unwrap();
+        let previous = latest_handoff_snapshot(dir.path().to_str().unwrap());
+
+        let ready = wait_for_latest_handoff(
+            dir.path().to_str().unwrap(),
+            previous,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+
+        assert!(!ready);
     }
 
     #[tokio::test]

@@ -1,9 +1,31 @@
 import { useState } from 'react'
 import { getInstanceId } from './projectUtils.js'
 
+function ConnectionDot({ status }) {
+  const color =
+    status === 'connected'
+      ? 'bg-green-500'
+      : status === 'connecting'
+        ? 'bg-yellow-500'
+        : 'bg-[#555555]'
+  return (
+    <span
+      className={`inline-block size-1.5 shrink-0 rounded-full ${color}`}
+      title={
+        status === 'connected'
+          ? 'PTY connected'
+          : status === 'connecting'
+            ? 'PTY connecting'
+            : 'PTY disconnected'
+      }
+    />
+  )
+}
+
 export default function TabBar({
   focusedProject,
   focusedInstanceId,
+  ptyConnections = {},
   onStartInstance,
   onFocusInstance,
   onStopInstance,
@@ -30,6 +52,7 @@ export default function TabBar({
           const id = getInstanceId(instance)
           const sid = id != null ? String(id) : ''
           const selected = sid !== '' && sid === String(focusedInstanceId ?? '')
+          const connStatus = ptyConnections[sid]
 
           return (
             <div
@@ -41,12 +64,13 @@ export default function TabBar({
               <button
                 type="button"
                 onClick={() => sid !== '' && onFocusInstance(sid)}
-                className={`flex max-w-[160px] min-w-0 items-center gap-1 border-b px-2 py-1 text-left font-medium ${
+                className={`flex max-w-[160px] min-w-0 items-center gap-1.5 border-b px-2 py-1 text-left font-medium ${
                   selected
                     ? 'border-[#3794ff] text-[#cccccc]'
                     : 'border-transparent text-[#cccccc]'
                 }`}
               >
+                <ConnectionDot status={connStatus} />
                 <span className="truncate">{`Terminal ${index + 1}`}</span>
               </button>
               <button
@@ -66,7 +90,7 @@ export default function TabBar({
         {instances.length >= 2 ? (
           <button
             type="button"
-            title="Execute handover"
+            title="Hand over work between terminals (Summary requires both connected)"
             onClick={onOpenHandover}
             className="rounded-sm border border-[#333333] bg-[#1e1e1e] px-2 py-1 text-[11px] font-medium text-[#cccccc] hover:bg-[#2a2d2e]"
           >

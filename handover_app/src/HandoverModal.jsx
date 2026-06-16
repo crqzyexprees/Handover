@@ -1,11 +1,29 @@
 import { useMemo, useState } from 'react'
 import { getInstanceId } from './projectUtils.js'
 
+const METHOD_HELP = {
+  git: 'Creates a version-history checkpoint for team handoffs or review, then prompts the receiving terminal.',
+  summary:
+    'Default for day-to-day AI handoffs. Prompts the source terminal to write `.handover/handoffs/latest.md`, waits for it, then directs the target to read it.',
+}
+
+function connectionLabel(status) {
+  if (status === 'connected') return 'connected'
+  if (status === 'connecting') return 'connecting…'
+  return 'disconnected'
+}
+
+function formatOptionLabel(baseLabel, status) {
+  const conn = connectionLabel(status)
+  return `${baseLabel} · ${conn}`
+}
+
 export default function HandoverModal({
   open,
   projectId,
   instances,
-  defaultMethod = 'git',
+  ptyConnections = {},
+  defaultMethod = 'summary',
   onClose,
   onExecute,
 }) {
@@ -30,6 +48,7 @@ export default function HandoverModal({
   const initialMethod = defaultMethod === 'summary' ? 'summary' : 'git'
   const [method, setMethod] = useState(initialMethod)
   const [taskDescription, setTaskDescription] = useState('')
+  const [executing, setExecuting] = useState(false)
 
   if (!open) return null
 
@@ -38,22 +57,50 @@ export default function HandoverModal({
   const effectiveFrom = fromInstanceId || first
   const effectiveTo = toInstanceId || second
   const trimmedTask = taskDescription.trim()
+
+  const fromConnected = ptyConnections[effectiveFrom] === 'connected'
+  const toConnected = ptyConnections[effectiveTo] === 'connected'
+  const connectionsReady =
+    method === 'summary' ? fromConnected && toConnected : toConnected
+
   const canExecute =
     trimmedTask !== '' &&
     effectiveFrom !== '' &&
     effectiveTo !== '' &&
-    effectiveFrom !== effectiveTo
+    effectiveFrom !== effectiveTo &&
+    instanceOptions.length >= 2 &&
+    connectionsReady &&
+    !executing
+
+  const connectionWarning = (() => {
+    if (instanceOptions.length < 2) {
+      return 'Open a second terminal to hand over.'
+    }
+    if (connectionsReady) return null
+    if (method === 'summary' && !fromConnected) {
+      return 'Source terminal is not connected — open it and wait for ● Connected.'
+    }
+    if (!toConnected) {
+      return 'Receiving terminal is not connected — open it and wait for ● Connected.'
+    }
+    return null
+  })()
 
   const handleExecute = async () => {
     if (!canExecute) return
-    await onExecute({
-      from_instance_id: effectiveFrom,
-      to_instance_id: effectiveTo,
-      project_id: projectId,
-      method,
-      task_description: trimmedTask,
-    })
-    onClose()
+    setExecuting(true)
+    try {
+      const ok = await onExecute({
+        from_instance_id: effectiveFrom,
+        to_instance_id: effectiveTo,
+        project_id: projectId,
+        method,
+        task_description: trimmedTask,
+      })
+      if (ok !== false) onClose()
+    } finally {
+      setExecuting(false)
+    }
   }
 
   return (
@@ -103,7 +150,7 @@ export default function HandoverModal({
             >
               {instanceOptions.map((opt) => (
                 <option key={`from-${opt.id}`} value={opt.id}>
-                  {opt.label}
+                  {formatOptionLabel(opt.label, ptyConnections[opt.id])}
                 </option>
               ))}
             </select>
@@ -124,7 +171,7 @@ export default function HandoverModal({
             >
               {instanceOptions.map((opt) => (
                 <option key={`to-${opt.id}`} value={opt.id}>
-                  {opt.label}
+                  {formatOptionLabel(opt.label, ptyConnections[opt.id])}
                 </option>
               ))}
             </select>
@@ -135,35 +182,52 @@ export default function HandoverModal({
           <legend className="px-1 text-xs font-semibold uppercase tracking-wide text-[#808080]">
             Handover Method
           </legend>
-          <div className="mt-2 flex flex-col gap-2 text-sm">
-            <label className="flex items-center gap-2">
+          <div className="mt-2 flex flex-col gap-3 text-sm">
+            <label className="flex cursor-pointer items-start gap-2">
               <input
                 type="radio"
                 name="handoverMethod"
                 value="git"
                 checked={method === 'git'}
                 onChange={(e) => setMethod(e.target.value)}
+                className="mt-0.5"
               />
-              Git Commit
+              <span>
+                <span className="font-medium">Git Commit</span>
+                <span className="mt-0.5 block text-xs leading-relaxed text-[#808080]">
+                  {METHOD_HELP.git}
+                </span>
+              </span>
             </label>
-            <label className="flex items-center gap-2">
+            <label className="flex cursor-pointer items-start gap-2">
               <input
                 type="radio"
                 name="handoverMethod"
                 value="summary"
                 checked={method === 'summary'}
                 onChange={(e) => setMethod(e.target.value)}
+                className="mt-0.5"
               />
-              AI-written Summary File
+              <span>
+                <span className="font-medium">Summary File</span>
+                <span className="mt-0.5 block text-xs leading-relaxed text-[#808080]">
+                  {METHOD_HELP.summary}
+                </span>
+              </span>
             </label>
           </div>
         </fieldset>
+
+        {connectionWarning ? (
+          <p className="mt-3 text-xs text-yellow-300">{connectionWarning}</p>
+        ) : null}
 
         <div className="mt-4 flex justify-end gap-2">
           <button
             type="button"
             onClick={onClose}
-            className="rounded border border-[#333333] bg-[#1e1e1e] px-3 py-1.5 text-sm text-[#cccccc] hover:bg-[#2a2d2e]"
+            disabled={executing}
+            className="rounded border border-[#333333] bg-[#1e1e1e] px-3 py-1.5 text-sm text-[#cccccc] hover:bg-[#2a2d2e] disabled:opacity-40"
           >
             Cancel
           </button>
@@ -173,7 +237,7 @@ export default function HandoverModal({
             onClick={() => void handleExecute()}
             className="rounded border border-[#333333] bg-[#37373d] px-3 py-1.5 text-sm text-[#cccccc] hover:bg-[#2a2d2e] disabled:cursor-not-allowed disabled:opacity-40"
           >
-            Execute Handover
+            {executing ? 'Executing…' : 'Execute Handover'}
           </button>
         </div>
       </div>

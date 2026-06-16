@@ -24,13 +24,17 @@ those terminals. The handoff modal supports two methods:
 
 - `AI-written Summary File`: prompts the source AI terminal to write
   `.handover/handoffs/latest.md` plus the next numbered history file, then
-  prompts the target terminal to read `latest.md` and continue.
+  waits up to 60 seconds before prompting the target terminal to read
+  `latest.md` and continue. This is the default for day-to-day AI handoffs.
 - `Git Commit`: creates a checkpoint commit when the worktree has changes, then
-  prompts the target terminal to inspect the latest commit.
+  prompts the target terminal to inspect the latest commit. Use this when you
+  want team-facing history or a review checkpoint.
 
 For summary handoffs, the user only needs to enter the goal or next direction.
 The source AI writes the detailed transfer context because it has the active
-conversation state.
+conversation state. If the file is not created before the timeout, Handover
+writes a fallback file with the user-provided goal and does not prompt the
+target terminal.
 
 ## Python Backend Fallback
 

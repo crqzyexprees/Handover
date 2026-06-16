@@ -17,12 +17,23 @@ async function request(fn) {
     const err = axios.isAxiosError(error)
       ? error.response?.data !== undefined
         ? typeof error.response.data === 'object' && error.response.data !== null
-          ? { status: error.response.status, ...error.response.data }
-          : { status: error.response.status, detail: error.response.data }
-        : { message: error.message, status: error.response?.status }
+          ? { httpStatus: error.response.status, ...error.response.data }
+          : { httpStatus: error.response.status, detail: error.response.data }
+        : { message: error.message, httpStatus: error.response?.status }
       : error
     return { data: null, error: err }
   }
+}
+
+/** Normalize handoff API responses (Rust may return status:error in HTTP 200 or 400). */
+export function parseHandoffResult(data) {
+  if (data?.status === 'error') {
+    return { ok: false, message: data.message ?? 'Handoff failed' }
+  }
+  if (data?.status === 'ok') {
+    return { ok: true, message: data.message ?? 'Handover complete' }
+  }
+  return { ok: false, message: 'Unexpected handoff response' }
 }
 
 export async function listProjects() {

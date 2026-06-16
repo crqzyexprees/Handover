@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api.js'
 import {
   getInstanceId,
@@ -16,7 +16,7 @@ const DEFAULT_PROJECT_CONFIG = {
   project_name: '',
   sandbox_mode: 'docker',
   mem_limit: '2g',
-  handoff_method: 'git',
+  handoff_method: 'summary',
   custom_env_vars: {},
 }
 
@@ -31,8 +31,16 @@ function formatApiError(error) {
       .join('; ')
   }
   if (error.message) return String(error.message)
-  if (error.status) return `Request failed (${error.status})`
+  if (error.httpStatus) return `Request failed (${error.httpStatus})`
+  if (typeof error.status === 'number') return `Request failed (${error.status})`
   return 'Request failed'
+}
+
+const TOAST_VARIANT_CLASS = {
+  error: 'border-red-800/60 bg-red-950/50 text-red-200',
+  success: 'border-green-800/60 bg-green-950/50 text-green-200',
+  warn: 'border-yellow-800/60 bg-yellow-950/50 text-yellow-200',
+  info: 'border-[#333333] bg-[#252526] text-[#cccccc]',
 }
 
 function ToastStack({ toasts }) {
@@ -41,7 +49,9 @@ function ToastStack({ toasts }) {
       {toasts.map((t) => (
         <div
           key={t.id}
-          className="pointer-events-auto rounded-sm border border-[#333333] bg-[#252526] px-3 py-2 text-sm text-[#cccccc] shadow-lg"
+          className={`pointer-events-auto rounded-sm border px-3 py-2 text-sm shadow-lg ${
+            TOAST_VARIANT_CLASS[t.variant] ?? TOAST_VARIANT_CLASS.info
+          }`}
         >
           {t.message}
         </div>
@@ -59,6 +69,8 @@ export default function App() {
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false)
   const [settingsProjectId, setSettingsProjectId] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [ptyConnections, setPtyConnections] = useState({})
+  const restoreToastShownRef = useRef(false)
 
   const pushToast = useCallback((message, variant = 'error') => {
     const id =
@@ -68,6 +80,15 @@ export default function App() {
     window.setTimeout(() => {
       setToasts((prev) => prev.filter((x) => x.id !== id))
     }, 5000)
+  }, [])
+
+  const handlePtyConnectionChange = useCallback((instanceId, status) => {
+    const id = String(instanceId ?? '')
+    if (id === '') return
+    setPtyConnections((prev) => {
+      if (prev[id] === status) return prev
+      return { ...prev, [id]: status }
+    })
   }, [])
 
   const refreshProjects = useCallback(async () => {
@@ -107,6 +128,13 @@ export default function App() {
         })
         return merged
       })
+      if (!restoreToastShownRef.current && incoming.length > 0) {
+        restoreToastShownRef.current = true
+        pushToast(
+          'Projects restored from your last session. Open a terminal to continue.',
+          'info',
+        )
+      }
       return merged
     }
     return null
@@ -452,10 +480,15 @@ export default function App() {
       const { data, error } = await api.executeHandover(payload)
       if (error) {
         pushToast(`Could not execute handover: ${formatApiError(error)}`, 'error')
-        return
+        return false
       }
-      console.log('Handover executed', data ?? payload)
-      pushToast(data?.message ?? 'Handover executed', 'info')
+      const result = api.parseHandoffResult(data)
+      if (!result.ok) {
+        pushToast(`Could not execute handover: ${result.message}`, 'error')
+        return false
+      }
+      pushToast(result.message ?? 'Handover executed', 'success')
+      return true
     },
     [pushToast],
   )
@@ -528,6 +561,7 @@ export default function App() {
         <TabBar
           focusedProject={focusedProject}
           focusedInstanceId={focusedInstanceId}
+          ptyConnections={ptyConnections}
           onStartInstance={handleStartInstance}
           onFocusInstance={handleFocusInstance}
           onStopInstance={handleStopInstance}
@@ -539,6 +573,7 @@ export default function App() {
               key={instance.instance_id}
               instanceId={instance.instance_id}
               isActive={instance.instance_id === String(focusedInstanceId ?? '')}
+              onConnectionChange={handlePtyConnectionChange}
             />
           ))}
           {allInstances.length === 0 ? (
@@ -554,6 +589,7 @@ export default function App() {
         open={handoverOpen}
         projectId={focusedProjectId}
         instances={getProjectInstances(focusedProject)}
+        ptyConnections={ptyConnections}
         defaultMethod={
           focusedProject?.config?.handoff_method ??
           DEFAULT_PROJECT_CONFIG.handoff_method

@@ -5,7 +5,7 @@ const DEFAULT_CONFIG = {
   project_name: '',
   sandbox_mode: 'docker',
   mem_limit: '2g',
-  handoff_method: 'git',
+  handoff_method: 'summary',
 }
 
 const MEMORY_OPTIONS = ['512m', '1g', '2g', '4g']
@@ -99,7 +99,7 @@ export default function ProjectSettings({
 
       const fallbackName = defaultProjectName.trim() || ''
       if (error) {
-        if (error?.status === 404) {
+        if (error?.httpStatus === 404 || error?.status === 404) {
           setConfig({ ...DEFAULT_CONFIG, project_name: fallbackName })
         } else {
           setErrorText('Could not load project settings. Using defaults.')
@@ -261,28 +261,41 @@ export default function ProjectSettings({
             <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-[#808080]">
               Default Handover Method
             </div>
-            <label className="mb-2 flex items-center gap-2 text-sm">
-              <input
-                type="radio"
-                name="handoff_method"
-                checked={config.handoff_method === 'git'}
-                onChange={() =>
-                  setConfig((prev) => ({ ...prev, handoff_method: 'git' }))
-                }
-              />
-              Git Commit
-            </label>
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="radio"
-                name="handoff_method"
-                checked={config.handoff_method === 'summary'}
-                onChange={() =>
-                  setConfig((prev) => ({ ...prev, handoff_method: 'summary' }))
-                }
-              />
-              Summary File
-            </label>
+            <div className="mb-2">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="radio"
+                  name="handoff_method"
+                  checked={config.handoff_method === 'git'}
+                  onChange={() =>
+                    setConfig((prev) => ({ ...prev, handoff_method: 'git' }))
+                  }
+                />
+                Git Commit
+              </label>
+              <p className="mt-1 pl-5 text-xs text-[#808080]">
+                Creates a version-history checkpoint for team handoffs or review, then
+                prompts the receiving terminal.
+              </p>
+            </div>
+            <div>
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="radio"
+                  name="handoff_method"
+                  checked={config.handoff_method === 'summary'}
+                  onChange={() =>
+                    setConfig((prev) => ({ ...prev, handoff_method: 'summary' }))
+                  }
+                />
+                Summary File
+              </label>
+              <p className="mt-1 pl-5 text-xs text-[#808080]">
+                Default for day-to-day AI handoffs. Prompts the source terminal to
+                write `.handover/handoffs/latest.md`, waits for it, then directs the
+                target to read it.
+              </p>
+            </div>
           </section>
 
           <section className="rounded-lg border-2 border-[#3794ff]/40 bg-[#1e1e1e] p-4">

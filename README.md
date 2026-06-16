@@ -27,23 +27,30 @@ and handoff routing.
 **AI-written Summary File**
 
 Use this when you want the current AI to create a transfer file for the next AI.
-You only enter the overall goal or next direction. Handover then:
+This is the default for day-to-day AI-to-AI handoffs. You only enter the
+overall goal or next direction. Handover then:
 
 - Prompts the source terminal's AI to write `.handover/handoffs/latest.md`.
 - Also asks it to create the next numbered history file, such as
   `.handover/handoffs/handoff_001.md`.
-- Prompts the target terminal's AI to read `.handover/handoffs/latest.md` and
-  continue from there.
+- Waits up to 60 seconds for `latest.md` to be created or updated.
+- Prompts the target terminal's AI to read `.handover/handoffs/latest.md` only
+  after the file is ready.
 
 The source AI writes the useful context because it already has the active
 conversation state: current goal, files changed, commands run, test results,
 decisions, blockers, and next steps.
 
+If the source AI does not create the file before the timeout, Handover writes a
+fallback file containing the user-provided goal and returns an error instead of
+prompting the target AI prematurely.
+
 **Git Commit**
 
-Use this when the project is a Git repository and you want a checkpoint commit.
-Handover stages the current worktree, creates a handoff commit when there are
-changes, and prompts the target terminal to inspect the latest commit.
+Use this when the project is a Git repository and you want a checkpoint commit
+for team handoffs, review, or version history. Handover stages the current
+worktree, creates a handoff commit when there are changes, and prompts the
+target terminal to inspect the latest commit.
 
 If there are no Git changes, Handover skips the empty commit and tells the next
 AI to inspect the current worktree and recent history.

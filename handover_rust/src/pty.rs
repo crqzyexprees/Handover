@@ -22,11 +22,31 @@ enum PtyControl {
 }
 
 pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Arc<AppState>) {
+    let (mut socket_tx, socket_rx) = socket.split();
+
+    async fn send_error(
+        socket_tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+        message: &str,
+    ) {
+        let _ = socket_tx
+            .send(Message::Text(Utf8Bytes::from(format!(
+                "\r\n\x1b[31m[handover] {message}\x1b[0m\r\n"
+            ))))
+            .await;
+    }
+
     let (sandbox_mode, container_id, cwd) = {
         let instances = state.instances.read().await;
         let instance = match instances.get(&instance_id) {
             Some(i) => i.clone(),
-            None => return,
+            None => {
+                send_error(
+                    &mut socket_tx,
+                    "Instance not found. Close this terminal and open a new one.",
+                )
+                .await;
+                return;
+            }
         };
         let mode = instance
             .get("sandbox_mode")
@@ -58,7 +78,16 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
     };
 
     if sandbox_mode == "docker" && container_id.as_deref().unwrap_or("").is_empty() {
+        send_error(
+            &mut socket_tx,
+            "Docker container is not running for this terminal. Try closing and reopening it.",
+        )
+        .await;
         return;
+    }
+
+    if let Some(existing) = state.pty_sessions.write().await.remove(&instance_id) {
+        close_existing_session(&existing);
     }
 
     let (input_tx, input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -80,11 +109,13 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         Ok(Ok(p)) => p,
         Ok(Err(e)) => {
             warn!("pty spawn failed: {e}");
+            send_error(&mut socket_tx, &format!("Failed to start shell: {e}")).await;
             state.pty_sessions.write().await.remove(&instance_id);
             return;
         }
         Err(e) => {
             warn!("pty task failed: {e}");
+            send_error(&mut socket_tx, &format!("Failed to start shell task: {e}")).await;
             state.pty_sessions.write().await.remove(&instance_id);
             return;
         }
@@ -125,7 +156,7 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         }
     });
 
-    let (mut ws_tx, mut ws_rx) = socket.split();
+    let (mut ws_tx, mut ws_rx) = (socket_tx, socket_rx);
 
     let ws_write = tokio::spawn(async move {
         while let Some(data) = pty_out_rx.recv().await {
@@ -176,6 +207,14 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         let _ = child.kill();
     });
     drop(master);
+}
+
+fn close_existing_session(session: &PtySession) {
+    if let Ok(mut close_tx) = session.close_tx.lock() {
+        if let Some(close_tx) = close_tx.take() {
+            let _ = close_tx.send(());
+        }
+    }
 }
 
 fn handle_control_message(
