@@ -22,14 +22,11 @@ dist-ssr
 *.sln
 *.sw?
 
-backend/venv/
 venv/
 __pycache__/
 *.py[cod]
 
 release/
-backend/build/
-backend/dist/
 
 .claude/settings.local.json
 **/.claude/settings.local.json

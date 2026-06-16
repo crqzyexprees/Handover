@@ -27,14 +27,14 @@ cargo run -- --host 127.0.0.1 --port 8765
 
 ## Electron integration
 
-`handover_python` spawns this binary automatically:
+`handover_app` spawns this binary automatically:
 
 - **Dev:** `target/debug/handover-backend`, or `cargo run` if not built yet
 - **Packaged:** `extraResources` bundles `target/release/handover-backend`
 
-Build the release binary before `npm run build` in `handover_python`:
+Build the release binary before `npm run build` in `handover_app`:
 
 ```bash
 cd handover_rust && cargo build --release
-cd ../handover_python && npm run build
+cd ../handover_app && npm run build
 ```

@@ -15,9 +15,9 @@ if git diff --cached --quiet; then
   echo "Nothing to commit."
 else
   git commit -m "$(cat <<'EOF'
-Restructure Handover as monorepo with Python and Rust.
+Restructure Handover app and backends.
 
-Add handover_python and handover_rust layout, restore Python backend as default, Rust scaffold, and terminal stats/WebGL work.
+Split Electron app, Rust backend, and legacy Python backend into handover_app, handover_rust, and handover_python.
 EOF
 )"
 fi

@@ -1,15 +1,16 @@
-# Handover (monorepo)
+# Handover
 
 Multi-terminal AI CLI orchestration with Docker sandboxes and project handoffs.
 
 | Directory | Role |
 |-----------|------|
-| [`handover_python/`](handover_python/) | Electron + React UI (xterm.js terminals) |
-| [`handover_rust/`](handover_rust/) | Rust backend used by the desktop app |
+| [`handover_app/`](handover_app/) | Electron + React desktop app |
+| [`handover_rust/`](handover_rust/) | Active Rust backend |
+| [`handover_python/`](handover_python/) | Legacy Python/FastAPI backend only |
 
-## Quick start
+## Quick Start
 
-### 1. Rust backend
+### 1. Build the Rust backend
 
 ```bash
 cd handover_rust
@@ -19,31 +20,39 @@ cargo build
 ### 2. Run the desktop app
 
 ```bash
-cd handover_python
+cd ../handover_app
 npm install
 npm run dev:electron
 ```
 
-Electron spawns the Rust backend automatically in development.
+The desktop app starts the Rust backend automatically on a free localhost port.
 
-### 3. Docker sandbox image (optional)
+### 3. Docker sandbox image
 
 ```bash
-docker build -f handover_python/backend/docker/Dockerfile.base -t handover-base:latest handover_python/backend/docker/
+docker build -f handover_python/docker/Dockerfile.base -t handover-base:latest handover_python/docker/
 ```
 
-## Distribution build
+## Distribution Build
 
-Build the Rust backend binary, then the Electron app:
+```bash
+cd handover_app
+npm run build:backend
+npm run build
+```
+
+The packaged app is written to `handover_app/release/` and bundles
+`handover_rust/target/release/handover-backend`.
+
+## Python Backend Fallback
+
+The old backend is kept in `handover_python/` for reference or fallback:
 
 ```bash
 cd handover_python
-npm run build:backend   # outputs ../handover_rust/target/release/handover-backend
-npm run build           # Vite + electron-builder
+python -m venv venv
+./venv/bin/pip install -r requirements.txt
+
+cd ../handover_app
+npm run dev:electron:python
 ```
-
-Installers land in `handover_python/release/`.
-
-## Python backend
-
-The previous Python backend is still present under `handover_python/backend/` for reference. Use `npm run dev:electron:python` or `npm run build:backend:python` from `handover_python/` if you need it.

@@ -1,7 +1,7 @@
 {
   "name": "handover",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "description": "Multi-terminal AI CLI orchestration with Docker sandboxes and project handoffs.",
   "author": "Handover",
   "type": "module",
@@ -12,7 +12,7 @@
     "dev:electron": "concurrently -k \"vite\" \"wait-on tcp:127.0.0.1:5173 && HANDOVER_BACKEND=rust VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "dev:electron:python": "concurrently -k \"vite\" \"wait-on tcp:127.0.0.1:5173 && VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "build:backend": "cd ../handover_rust && cargo build --release",
-    "build:backend:python": "cd backend && ./venv/bin/pyinstaller handover-backend.spec",
+    "build:backend:python": "cd ../handover_python && ./venv/bin/pyinstaller handover-backend.spec",
     "build": "vite build && electron-builder --config electron-builder.config.cjs",
     "lint": "eslint .",
     "preview": "vite preview"

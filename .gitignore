@@ -18,15 +18,18 @@ lerna-debug.log*
 *.sln
 *.sw?
 
-# Python stack (handover_python)
-handover_python/node_modules
-handover_python/dist
-handover_python/dist-ssr
-handover_python/*.local
-handover_python/release
-handover_python/backend/venv/
-handover_python/backend/build/
-handover_python/backend/dist/
+# Desktop app stack (handover_app)
+handover_app/node_modules
+handover_app/dist
+handover_app/dist-ssr
+handover_app/*.local
+handover_app/release
+handover_app/venv/
+
+# Legacy Python backend (handover_python)
+handover_python/venv/
+handover_python/build/
+handover_python/dist/
 handover_python/**/__pycache__/
 handover_python/**/*.py[cod]
 

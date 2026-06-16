@@ -76,12 +76,12 @@ function getRustBackendSpawnOptions() {
 }
 
 function getPythonBackendSpawnOptions() {
-  const backendDir = path.join(__dirname, '../backend')
+  const backendDir = path.join(__dirname, '../../handover_python')
   const python = path.join(backendDir, 'venv/bin/python')
   if (!fs.existsSync(python)) {
     throw new Error(
       `Python venv not found at ${python}. ` +
-        'Create it: cd handover_python/backend && python -m venv venv && ./venv/bin/pip install -r requirements.txt',
+        'Create it: cd handover_python && python -m venv venv && ./venv/bin/pip install -r requirements.txt',
     )
   }
   return {
@@ -139,7 +139,7 @@ async function waitForBackend(port, timeoutMs = 120_000) {
   }
   throw new Error(
     `Backend did not respond on ${url} within ${timeoutMs / 1000}s. ` +
-      'Ensure the Python venv is set up (see handover_python/README.md).',
+      'Ensure the selected backend is set up (see README.md).',
   )
 }
 
