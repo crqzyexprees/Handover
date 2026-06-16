@@ -6,10 +6,20 @@ use anyhow::Context;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket};
 use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 use crate::state::{AppState, PtySession};
+
+const CONTROL_PREFIX: &str = "__handover_control__:";
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum PtyControl {
+    #[serde(rename = "resize")]
+    Resize { cols: u16, rows: u16 },
+}
 
 pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Arc<AppState>) {
     let (sandbox_mode, container_id, cwd) = {
@@ -87,6 +97,7 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         master,
         child,
     } = pty;
+    let master = Arc::new(std::sync::Mutex::new(master));
 
     tokio::task::spawn_blocking(move || {
         let mut reader = reader;
@@ -138,6 +149,10 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
                 };
                 match msg {
                     Message::Text(text) => {
+                        if let Some(control) = text.strip_prefix(CONTROL_PREFIX) {
+                            handle_control_message(control, &master);
+                            continue;
+                        }
                         if let Some(session) = state.pty_sessions.read().await.get(&instance_id) {
                             let _ = session.input_tx.send(text.as_bytes().to_vec());
                         }
@@ -161,6 +176,30 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         let _ = child.kill();
     });
     drop(master);
+}
+
+fn handle_control_message(
+    payload: &str,
+    master: &Arc<std::sync::Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+) {
+    let Ok(control) = serde_json::from_str::<PtyControl>(payload) else {
+        return;
+    };
+    match control {
+        PtyControl::Resize { cols, rows } => {
+            if cols == 0 || rows == 0 {
+                return;
+            }
+            if let Ok(master) = master.lock() {
+                let _ = master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+            }
+        }
+    }
 }
 
 struct PtyHandles {

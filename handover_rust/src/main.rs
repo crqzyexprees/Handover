@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::docker::DockerRuntime;
@@ -44,6 +45,41 @@ struct ServerCtx {
 
 fn api_err(status: StatusCode, detail: impl Into<String>) -> Response {
     (status, Json(json!({ "detail": detail.into() }))).into_response()
+}
+
+async fn persist_or_500(state: &AppState) -> Result<(), Response> {
+    state.save_persisted().await.map_err(|e| {
+        api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("state save failed: {e}"),
+        )
+    })
+}
+
+fn validate_project_path(path: &str) -> Result<String, Response> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Project path is required"));
+    }
+
+    let canonical = std::fs::canonicalize(trimmed).map_err(|e| {
+        api_err(
+            StatusCode::BAD_REQUEST,
+            format!("Project path does not exist or is not readable: {e}"),
+        )
+    })?;
+
+    if !canonical.is_dir() {
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            "Project path must be a directory",
+        ));
+    }
+
+    canonical
+        .to_str()
+        .map(String::from)
+        .ok_or_else(|| api_err(StatusCode::BAD_REQUEST, "Project path is not valid UTF-8"))
 }
 
 async fn get_docker(ctx: &ServerCtx) -> Result<Arc<DockerRuntime>, Response> {
@@ -151,6 +187,10 @@ async fn update_config(State(ctx): State<ServerCtx>, Json(body): Json<Value>) ->
             base.insert(k.clone(), v.clone());
         }
     }
+    drop(cfg);
+    if let Err(e) = ctx.state.save_persisted().await {
+        warn!("failed to persist app config: {e}");
+    }
     Json(json!({ "status": "ok" }))
 }
 
@@ -202,16 +242,17 @@ async fn create_project(
             format!("sandbox_mode must be one of {SANDBOX_MODES:?}"),
         ));
     }
+    let project_path = validate_project_path(&body.path)?;
     let project_id = Uuid::new_v4().to_string();
-    let name = basename_from_path(&body.path);
+    let name = basename_from_path(&project_path);
     let project = json!({
         "id": project_id,
-        "path": body.path,
+        "path": project_path,
         "name": name,
         "sandbox_mode": body.sandbox_mode,
         "state": "active",
     });
-    let mut config = default_project_config(&body.path);
+    let mut config = default_project_config(&project_path);
     if let Some(obj) = config.as_object_mut() {
         obj.insert("sandbox_mode".into(), json!(body.sandbox_mode));
     }
@@ -230,6 +271,7 @@ async fn create_project(
         .write()
         .await
         .insert(project_id, monotonic_secs());
+    persist_or_500(&ctx.state).await?;
 
     let mut out = project;
     if let Some(obj) = out.as_object_mut() {
@@ -316,6 +358,7 @@ async fn save_project_config(
             obj.insert("name".into(), json!(display_name));
         }
     }
+    persist_or_500(&ctx.state).await?;
     Ok(Json(saved))
 }
 
@@ -332,7 +375,9 @@ async fn activate_project(
         if let Ok(docker) = get_docker(&ctx).await {
             let ids = project_container_ids(&ctx.state, &project_id).await;
             for id in ids {
-                docker.resume_container(&id).await;
+                if let Err(e) = docker.resume_container(&id).await {
+                    warn!("failed to resume container while activating project: {e}");
+                }
             }
         }
         if let Some(obj) = project.as_object_mut() {
@@ -347,6 +392,7 @@ async fn activate_project(
         .write()
         .await
         .insert(project_id, monotonic_secs());
+    persist_or_500(&ctx.state).await?;
     Ok(Json(json!({ "status": "ok" })))
 }
 
@@ -360,7 +406,10 @@ async fn resume_project(
     let docker = get_docker(&ctx).await?;
     let ids = project_container_ids(&ctx.state, &project_id).await;
     for id in ids {
-        docker.resume_container(&id).await;
+        docker
+            .resume_container(&id)
+            .await
+            .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     }
     if let Some(p) = ctx.state.projects.write().await.get_mut(&project_id) {
         if let Some(obj) = p.as_object_mut() {
@@ -372,6 +421,7 @@ async fn resume_project(
         .write()
         .await
         .insert(project_id, monotonic_secs());
+    persist_or_500(&ctx.state).await?;
     Ok(Json(json!({ "status": "ok", "state": "active" })))
 }
 
@@ -399,6 +449,11 @@ async fn unload_project(
         .collect();
 
     ctx.state.project_configs.write().await.remove(&project_id);
+    ctx.state
+        .project_last_active
+        .write()
+        .await
+        .remove(&project_id);
 
     let docker = ctx.docker.read().await.clone();
     for instance_id in instance_ids {
@@ -409,13 +464,18 @@ async fn unload_project(
         if let Some(inst) = instance {
             if let Some(cid) = inst.get("container_id").and_then(|v| v.as_str()) {
                 if let Some(d) = docker.as_ref() {
-                    d.stop_container(cid).await;
+                    if let Err(e) = d.stop_container(cid).await {
+                        warn!("failed to stop container while unloading project: {e}");
+                    }
                 }
             }
         }
     }
 
     ctx.state.projects.write().await.remove(&project_id);
+    if let Err(e) = ctx.state.save_persisted().await {
+        warn!("failed to persist project unload: {e}");
+    }
     Json(json!({ "status": "ok", "message": "Project unloaded" }))
 }
 
@@ -491,7 +551,9 @@ async fn delete_instance(
             if let Some(docker) = ctx.docker.read().await.clone() {
                 let cid = cid.to_string();
                 tokio::spawn(async move {
-                    docker.stop_container(&cid).await;
+                    if let Err(e) = docker.stop_container(&cid).await {
+                        warn!("failed to stop deleted instance container: {e}");
+                    }
                 });
             }
         }
@@ -592,14 +654,15 @@ async fn execute_handoff(
         .and_then(|v| v.as_str())
         .ok_or_else(|| api_err(StatusCode::INTERNAL_SERVER_ERROR, "project path missing"))?;
 
+    let mut handoff_message = "Handoff complete".to_string();
     let injection_prompt = if body.method == "git" {
-        match handoff::git_handoff(
+        let outcome = match handoff::git_handoff(
             project_path,
             &format!("Handoff checkpoint: {}", body.task_description),
         )
         .await
         {
-            Ok(()) => {}
+            Ok(outcome) => outcome,
             Err(_) => {
                 return Ok((
                     StatusCode::BAD_REQUEST,
@@ -610,11 +673,17 @@ async fn execute_handoff(
                 )
                     .into_response());
             }
+        };
+        match outcome {
+            handoff::GitHandoffOutcome::Committed => {
+                "You are taking over this project. The previous AI just committed their work. Please review the latest git commit using 'git log -1 -p' to understand the current state of the codebase. Your overall goal is: {task}. Continue working on this goal from where the previous AI left off."
+            }
+            handoff::GitHandoffOutcome::NoChanges => {
+                handoff_message = "Handoff complete; no git changes needed a new commit".to_string();
+                "You are taking over this project. The previous AI found no uncommitted changes to checkpoint. Please inspect the current worktree and recent history with 'git status' and 'git log -1 --stat'. Your overall goal is: {task}. Continue working on this goal from where the previous AI left off."
+            }
         }
-        format!(
-            "You are taking over this project. The previous AI just committed their work. Please review the latest git commit using 'git log -1 -p' to understand the current state of the codebase. Your overall goal is: {}. Continue working on this goal from where the previous AI left off.",
-            body.task_description
-        )
+        .replace("{task}", &body.task_description)
     } else {
         handoff::summary_handoff(project_path, &body.task_description)
             .await
@@ -639,7 +708,7 @@ async fn execute_handoff(
         let _ = session.input_tx.send(line);
     }
 
-    Ok(Json(json!({ "status": "ok", "message": "Handoff complete" })).into_response())
+    Ok(Json(json!({ "status": "ok", "message": handoff_message })).into_response())
 }
 
 async fn ws_pty(
@@ -660,6 +729,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let state = AppState::new();
+    if let Err(e) = state.load_persisted().await {
+        warn!("[startup] failed to load persisted app state: {e}");
+    }
     let docker_slot: Arc<RwLock<Option<Arc<DockerRuntime>>>> = Arc::new(RwLock::new(None));
 
     match DockerRuntime::new() {
@@ -716,4 +788,27 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn validate_project_path_accepts_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let validated = validate_project_path(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            PathBuf::from(validated),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn validate_project_path_rejects_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(validate_project_path(missing.to_str().unwrap()).is_err());
+    }
 }

@@ -1,7 +1,11 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::fs;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 pub const DEFAULT_MEM_LIMIT: &str = "2g";
@@ -28,6 +32,18 @@ pub struct AppState {
     pub app_config: RwLock<Value>,
 }
 
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct PersistedState {
+    #[serde(default)]
+    projects: HashMap<String, Value>,
+    #[serde(default)]
+    project_configs: HashMap<String, Value>,
+    #[serde(default)]
+    project_last_active: HashMap<String, f64>,
+    #[serde(default)]
+    app_config: Option<Value>,
+}
+
 impl AppState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -44,6 +60,66 @@ impl AppState {
             })),
         })
     }
+
+    pub async fn load_persisted(&self) -> anyhow::Result<()> {
+        self.load_persisted_from_path(state_path()).await
+    }
+
+    async fn load_persisted_from_path(&self, path: PathBuf) -> anyhow::Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let content = fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let persisted: PersistedState = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+
+        *self.projects.write().await = persisted.projects;
+        *self.project_configs.write().await = persisted.project_configs;
+        *self.project_last_active.write().await = persisted.project_last_active;
+        if let Some(app_config) = persisted.app_config {
+            *self.app_config.write().await = app_config;
+        }
+        Ok(())
+    }
+
+    pub async fn save_persisted(&self) -> anyhow::Result<()> {
+        self.save_persisted_to_path(state_path()).await
+    }
+
+    async fn save_persisted_to_path(&self, path: PathBuf) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        let snapshot = PersistedState {
+            projects: self.projects.read().await.clone(),
+            project_configs: self.project_configs.read().await.clone(),
+            project_last_active: self.project_last_active.read().await.clone(),
+            app_config: Some(self.app_config.read().await.clone()),
+        };
+        let content = serde_json::to_string_pretty(&snapshot)?;
+        fs::write(&path, content)
+            .await
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(())
+    }
+}
+
+fn state_path() -> PathBuf {
+    if let Ok(path) = std::env::var("HANDOVER_STATE_PATH") {
+        return PathBuf::from(path);
+    }
+    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+        return PathBuf::from(data_home).join("handover/state.json");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local/share/handover/state.json");
+    }
+    PathBuf::from(".handover/state.json")
 }
 
 pub fn basename_from_path(path: &str) -> String {
@@ -89,4 +165,62 @@ pub async fn project_container_ids(state: &AppState, project_id: &str) -> Vec<St
                 .map(String::from)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn persisted_state_round_trips_projects_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let state = AppState::new();
+
+        state.projects.write().await.insert(
+            "project-1".into(),
+            json!({
+                "id": "project-1",
+                "path": "/tmp/project",
+                "name": "project",
+                "state": "active"
+            }),
+        );
+        state
+            .project_configs
+            .write()
+            .await
+            .insert("project-1".into(), default_project_config("/tmp/project"));
+        state
+            .project_last_active
+            .write()
+            .await
+            .insert("project-1".into(), 42.0);
+        state.save_persisted_to_path(path.clone()).await.unwrap();
+
+        let restored = AppState::new();
+        restored.load_persisted_from_path(path).await.unwrap();
+
+        assert!(restored.projects.read().await.contains_key("project-1"));
+        assert!(restored
+            .project_configs
+            .read()
+            .await
+            .contains_key("project-1"));
+        assert_eq!(
+            restored
+                .project_last_active
+                .read()
+                .await
+                .get("project-1")
+                .copied(),
+            Some(42.0)
+        );
+    }
+
+    #[test]
+    fn basename_handles_empty_and_trailing_slashes() {
+        assert_eq!(basename_from_path("/tmp/example/"), "example");
+        assert_eq!(basename_from_path(""), "Unknown");
+    }
 }

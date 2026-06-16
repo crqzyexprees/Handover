@@ -183,9 +183,8 @@ impl DockerRuntime {
         Ok(id)
     }
 
-    pub async fn stop_container(&self, container_id: &str) {
-        let _ = self
-            .docker
+    pub async fn stop_container(&self, container_id: &str) -> Result<()> {
+        self.docker
             .remove_container(
                 container_id,
                 Some(RemoveContainerOptions {
@@ -193,15 +192,25 @@ impl DockerRuntime {
                     ..Default::default()
                 }),
             )
-            .await;
+            .await
+            .with_context(|| format!("failed to remove container {container_id}"))?;
+        Ok(())
     }
 
-    pub async fn pause_container(&self, container_id: &str) {
-        let _ = self.docker.pause_container(container_id).await;
+    pub async fn pause_container(&self, container_id: &str) -> Result<()> {
+        self.docker
+            .pause_container(container_id)
+            .await
+            .with_context(|| format!("failed to pause container {container_id}"))?;
+        Ok(())
     }
 
-    pub async fn resume_container(&self, container_id: &str) {
-        let _ = self.docker.unpause_container(container_id).await;
+    pub async fn resume_container(&self, container_id: &str) -> Result<()> {
+        self.docker
+            .unpause_container(container_id)
+            .await
+            .with_context(|| format!("failed to resume container {container_id}"))?;
+        Ok(())
     }
 
     pub async fn get_container_stats(&self, container_id: &str) -> serde_json::Value {
@@ -372,4 +381,25 @@ fn mem_used_mb(stats: &Stats) -> f64 {
 fn mem_limit_mb(stats: &Stats) -> f64 {
     let limit = stats.memory_stats.limit.unwrap_or(0) as f64;
     (limit / (1024.0 * 1024.0) * 10.0).round() / 10.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_mem_bytes_supports_gigabytes_and_megabytes() {
+        assert_eq!(parse_mem_bytes("2g"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_mem_bytes("512m"), 512 * 1024 * 1024);
+        assert_eq!(
+            parse_mem_bytes("1.5g"),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as i64
+        );
+    }
+
+    #[test]
+    fn parse_mem_bytes_falls_back_for_invalid_values() {
+        assert_eq!(parse_mem_bytes("bad"), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_mem_bytes(""), 2 * 1024 * 1024 * 1024);
+    }
 }

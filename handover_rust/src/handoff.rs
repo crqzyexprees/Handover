@@ -2,29 +2,43 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use git2::Repository;
+use git2::{Repository, Signature};
 use tokio::fs;
 
-pub async fn git_handoff(project_path: &str, summary_text: &str) -> Result<()> {
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum GitHandoffOutcome {
+    Committed,
+    NoChanges,
+}
+
+pub async fn git_handoff(project_path: &str, summary_text: &str) -> Result<GitHandoffOutcome> {
     let path = project_path.to_string();
     let message = summary_text.to_string();
-    tokio::task::spawn_blocking(move || -> Result<()> {
+    let outcome = tokio::task::spawn_blocking(move || -> Result<GitHandoffOutcome> {
         let repo = Repository::open(&path).context("not a git repository")?;
         let mut index = repo.index()?;
         index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+        index.update_all(["*"].iter(), None)?;
         index.write()?;
         let tree_id = index.write_tree()?;
         let tree = repo.find_tree(tree_id)?;
-        let sig = repo.signature()?;
         let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        if let Some(parent) = parent.as_ref() {
+            if parent.tree_id() == tree_id {
+                return Ok(GitHandoffOutcome::NoChanges);
+            }
+        }
+        let sig = repo
+            .signature()
+            .or_else(|_| Signature::now("Handover", "handover@local"))?;
         match parent {
             Some(parent) => repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent])?,
             None => repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[])?,
         };
-        Ok(())
+        Ok(GitHandoffOutcome::Committed)
     })
     .await??;
-    Ok(())
+    Ok(outcome)
 }
 
 fn next_handoff_path(handoffs_dir: &Path) -> PathBuf {
@@ -58,4 +72,51 @@ pub async fn summary_handoff(project_path: &str, task_description: &str) -> Resu
     fs::write(&numbered, &content).await?;
     fs::write(&latest, &content).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git2::Repository;
+
+    #[tokio::test]
+    async fn summary_handoff_writes_numbered_history_and_latest() {
+        let dir = tempfile::tempdir().unwrap();
+
+        summary_handoff(dir.path().to_str().unwrap(), "first task")
+            .await
+            .unwrap();
+        summary_handoff(dir.path().to_str().unwrap(), "second task")
+            .await
+            .unwrap();
+
+        let handoffs = dir.path().join(".handover/handoffs");
+        assert!(handoffs.join("handoff_001.md").is_file());
+        assert!(handoffs.join("handoff_002.md").is_file());
+        let latest = std::fs::read_to_string(handoffs.join("latest.md")).unwrap();
+        assert!(latest.contains("second task"));
+    }
+
+    #[tokio::test]
+    async fn git_handoff_commits_changes_and_skips_clean_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README.md"), "hello").unwrap();
+
+        let first = git_handoff(dir.path().to_str().unwrap(), "first checkpoint")
+            .await
+            .unwrap();
+        assert_eq!(first, GitHandoffOutcome::Committed);
+
+        let second = git_handoff(dir.path().to_str().unwrap(), "second checkpoint")
+            .await
+            .unwrap();
+        assert_eq!(second, GitHandoffOutcome::NoChanges);
+
+        std::fs::write(dir.path().join("README.md"), "hello again").unwrap();
+        let third = git_handoff(dir.path().to_str().unwrap(), "third checkpoint")
+            .await
+            .unwrap();
+        assert_eq!(third, GitHandoffOutcome::Committed);
+    }
 }

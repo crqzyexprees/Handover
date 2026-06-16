@@ -10,6 +10,7 @@ const ANSI_RED = '\x1b[31m'
 const ANSI_RESET = '\x1b[0m'
 
 const STATS_POLL_MS = 5000
+const CONTROL_PREFIX = '__handover_control__:'
 
 export default function TerminalView({ instanceId, isActive }) {
   const containerRef = useRef(null)
@@ -56,15 +57,26 @@ export default function TerminalView({ instanceId, isActive }) {
       webglAddon = null
     }
 
+    const sendResize = () => {
+      if (!alive || ws.readyState !== WebSocket.OPEN) return
+      ws.send(
+        `${CONTROL_PREFIX}${JSON.stringify({
+          type: 'resize',
+          cols: term.cols,
+          rows: term.rows,
+        })}`,
+      )
+    }
+
     const safeFit = () => {
       if (!alive) return
       try {
         fitAddon.fit()
+        sendResize()
       } catch {
         // Dimensions may be zero during layout
       }
     }
-    safeFit()
 
     const urlParams = new URLSearchParams(window.location.search)
     const port = urlParams.get('port') || '8765'
@@ -83,6 +95,8 @@ export default function TerminalView({ instanceId, isActive }) {
     ws.onopen = () => {
       if (!alive) return
       term.writeln(`${ANSI_GREEN}● Connected${ANSI_RESET}`)
+      safeFit()
+      sendResize()
     }
 
     ws.onmessage = (event) => {
@@ -107,6 +121,10 @@ export default function TerminalView({ instanceId, isActive }) {
       }
     })
 
+    const resizeSub = term.onResize(() => {
+      sendResize()
+    })
+
     const resizeObserver = new ResizeObserver(() => {
       safeFit()
     })
@@ -116,6 +134,7 @@ export default function TerminalView({ instanceId, isActive }) {
       alive = false
       resizeObserver.disconnect()
       dataSub.dispose()
+      resizeSub.dispose()
       if (webglAddon) {
         try {
           webglAddon.dispose()

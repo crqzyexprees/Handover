@@ -58,13 +58,19 @@ async fn suspend_project(state: &AppState, docker: &DockerRuntime, project_id: &
         return false;
     }
     for id in &container_ids {
-        let _ = docker.pause_container(id).await;
+        if let Err(e) = docker.pause_container(id).await {
+            warn!("[governor] failed to pause container {id}: {e}");
+        }
     }
     let mut projects = state.projects.write().await;
     if let Some(project) = projects.get_mut(project_id) {
         if let Some(obj) = project.as_object_mut() {
             obj.insert("state".into(), serde_json::json!("suspended"));
         }
+    }
+    drop(projects);
+    if let Err(e) = state.save_persisted().await {
+        warn!("[governor] failed to persist suspended state: {e}");
     }
     info!(
         "[governor] suspended project {project_id} ({} container(s) paused)",
