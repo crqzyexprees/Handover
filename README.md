@@ -2,7 +2,7 @@
 
 Multi-terminal AI CLI orchestration with Docker sandboxes and project handoffs.
 
-**Current release:** v1.0.3
+**Current release:** v1.0.4
 
 | Directory | Role |
 |-----------|------|
@@ -81,6 +81,22 @@ npm run build:tauri
 This builds icons, the release Rust binary, the sidecar bundle, and the Tauri AppImage. (`build:tauri` runs `build:backend` internally — no need to call it separately.)
 
 Output: `handover_app/src-tauri/target/release/bundle/`
+
+## Platform Build Notes
+
+Build release packages on the target OS:
+
+- Linux: build on Linux for AppImage output.
+- macOS: build on macOS for `.app`/`.dmg` output. The generated `icon.icns`
+  is currently a placeholder and should be replaced with a real macOS `.icns`
+  before public distribution.
+- Windows: build on Windows with the Rust MSVC toolchain and Visual Studio
+  Build Tools installed.
+
+Docker mode requires Docker Desktop on macOS and Windows.
+
+For public macOS or Windows distribution, code signing is recommended to avoid
+Gatekeeper, SmartScreen, and installer trust warnings.
 
 ## Browser-only dev
 
