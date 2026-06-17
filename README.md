@@ -2,7 +2,7 @@
 
 Multi-terminal AI CLI orchestration with Docker sandboxes and project handoffs.
 
-**Current release:** v1.0.4
+**Current release:** v1.0.5
 
 | Directory | Role |
 |-----------|------|
