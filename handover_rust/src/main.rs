@@ -1,6 +1,7 @@
 mod docker;
 mod governor;
 mod handoff;
+mod local_config;
 mod pty;
 mod state;
 
@@ -8,7 +9,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Path, State, WebSocketUpgrade};
+use axum::extract::{Path, Query, State, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -18,15 +19,26 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
-use tracing::info;
 use tracing::warn;
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use crate::docker::DockerRuntime;
 use crate::state::{
     basename_from_path, default_project_config, monotonic_secs, project_container_ids, AppState,
-    DEFAULT_MEM_LIMIT, HANDOFF_METHODS, SANDBOX_MODES,
+    DEFAULT_MEM_LIMIT, HANDOFF_METHODS, HANDOFF_TEMPLATES, RAM_EMERGENCY_THRESHOLD,
+    RAM_SUSPEND_THRESHOLD, SANDBOX_MODES,
 };
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .compact()
+        .init();
+}
 
 #[derive(Parser)]
 #[command(name = "handover-backend")]
@@ -134,7 +146,13 @@ struct ProjectConfigBody {
     mem_limit: String,
     #[serde(default = "default_handoff_method")]
     handoff_method: String,
+    #[serde(default = "default_handoff_template")]
+    handoff_template: String,
     custom_env_vars: Option<HashMap<String, String>>,
+}
+
+fn default_handoff_template() -> String {
+    "generic".into()
 }
 
 fn default_mem() -> String {
@@ -271,6 +289,9 @@ async fn create_project(
         .write()
         .await
         .insert(project_id, monotonic_secs());
+    if let Err(e) = local_config::write_local_config(&project_path, &config).await {
+        warn!("failed to write .handover/config.yml on create: {e}");
+    }
     persist_or_500(&ctx.state).await?;
 
     let mut out = project;
@@ -278,6 +299,30 @@ async fn create_project(
         obj.insert("config".into(), config);
     }
     Ok(Json(out))
+}
+
+async fn merged_project_config(
+    ctx: &ServerCtx,
+    project_id: &str,
+    path: &str,
+) -> Result<Value, Response> {
+    let mut configs = ctx.state.project_configs.write().await;
+    if !configs.contains_key(project_id) {
+        configs.insert(project_id.to_string(), default_project_config(path));
+    }
+    let persisted = configs[project_id].clone();
+    drop(configs);
+
+    let base = default_project_config(path);
+    let file_config = local_config::read_local_config(path)
+        .await
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut merged = base;
+    if let Some(file) = file_config {
+        merged = local_config::merge_config_values(merged, file);
+    }
+    merged = local_config::merge_config_values(merged, persisted);
+    Ok(merged)
 }
 
 async fn get_project_config(
@@ -296,11 +341,7 @@ async fn get_project_config(
         .and_then(|p| p.get("path").and_then(|v| v.as_str()).map(String::from))
         .unwrap_or_default();
 
-    let mut configs = ctx.state.project_configs.write().await;
-    if !configs.contains_key(&project_id) {
-        configs.insert(project_id.clone(), default_project_config(&path));
-    }
-    Ok(Json(configs[&project_id].clone()))
+    Ok(Json(merged_project_config(&ctx, &project_id, &path).await?))
 }
 
 async fn save_project_config(
@@ -331,6 +372,12 @@ async fn save_project_config(
             format!("handoff_method must be one of {HANDOFF_METHODS:?}"),
         ));
     }
+    if !HANDOFF_TEMPLATES.contains(&body.handoff_template.as_str()) {
+        return Err(api_err(
+            StatusCode::BAD_REQUEST,
+            format!("handoff_template must be one of {HANDOFF_TEMPLATES:?}"),
+        ));
+    }
 
     let display_name = body
         .project_name
@@ -345,6 +392,7 @@ async fn save_project_config(
         "sandbox_mode": body.sandbox_mode,
         "mem_limit": body.mem_limit,
         "handoff_method": body.handoff_method,
+        "handoff_template": body.handoff_template,
         "custom_env_vars": body.custom_env_vars.unwrap_or_default(),
     });
 
@@ -358,6 +406,9 @@ async fn save_project_config(
             obj.insert("name".into(), json!(display_name));
         }
     }
+    local_config::write_local_config(&path, &saved)
+        .await
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     persist_or_500(&ctx.state).await?;
     Ok(Json(saved))
 }
@@ -697,11 +748,14 @@ async fn execute_handoff(
         }
         .replace("{task}", &body.task_description)
     } else {
+        let merged = merged_project_config(&ctx, &body.project_id, project_path).await?;
+        let handoff_template = merged
+            .get("handoff_template")
+            .and_then(|v| v.as_str())
+            .unwrap_or("generic");
         let previous_snapshot = handoff::latest_handoff_snapshot(project_path);
-        let source_prompt = format!(
-            "Create a handoff file for the next AI now. Write concise Markdown to '.handover/handoffs/latest.md' and also create the next numbered history file under '.handover/handoffs/' as 'handoff_NNN.md' with the same content. Include: current goal, project context, files changed, commands run, tests/results, decisions made, blockers, and exact next steps. Overall goal: {}. After writing the files, stop and wait.",
-            body.task_description
-        );
+        let source_prompt =
+            handoff::build_summary_source_prompt(&body.task_description, handoff_template);
         if !send_prompt_to_instance(&ctx.state, &body.from_instance_id, &source_prompt).await {
             return Err(api_err(
                 StatusCode::BAD_REQUEST,
@@ -757,6 +811,233 @@ async fn execute_handoff(
     Ok(Json(json!({ "status": "ok", "message": handoff_message })).into_response())
 }
 
+async fn project_path_for(
+    ctx: &ServerCtx,
+    project_id: &str,
+) -> Result<String, Response> {
+    ctx.state
+        .projects
+        .read()
+        .await
+        .get(project_id)
+        .and_then(|p| p.get("path").and_then(|v| v.as_str()).map(String::from))
+        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "Project not found"))
+}
+
+async fn list_project_handoffs(
+    State(ctx): State<ServerCtx>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let path = project_path_for(&ctx, &project_id).await?;
+    let files = handoff::list_handoff_files(&path)
+        .await
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!({ "files": files })))
+}
+
+async fn export_project_handoffs(
+    State(ctx): State<ServerCtx>,
+    Path(project_id): Path<String>,
+) -> Result<impl IntoResponse, Response> {
+    let path = project_path_for(&ctx, &project_id).await?;
+    let markdown = handoff::export_handoff_log(&path)
+        .await
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        markdown,
+    ))
+}
+
+async fn get_project_handoff_file(
+    State(ctx): State<ServerCtx>,
+    Path((project_id, filename)): Path<(String, String)>,
+) -> Result<Json<Value>, Response> {
+    if !handoff::is_valid_handoff_filename(&filename) {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Invalid handoff filename"));
+    }
+    let path = project_path_for(&ctx, &project_id).await?;
+    let content = handoff::read_handoff_file(&path, &filename)
+        .await
+        .map_err(|e| api_err(StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(Json(json!({ "filename": filename, "content": content })))
+}
+
+#[derive(Deserialize)]
+struct DiffQuery {
+    from: String,
+    to: String,
+}
+
+async fn diff_project_handoffs(
+    State(ctx): State<ServerCtx>,
+    Path(project_id): Path<String>,
+    Query(q): Query<DiffQuery>,
+) -> Result<Json<Value>, Response> {
+    let path = project_path_for(&ctx, &project_id).await?;
+    let diff = handoff::diff_handoff_files(&path, &q.from, &q.to)
+        .await
+        .map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!({ "from": q.from, "to": q.to, "diff": diff })))
+}
+
+async fn project_git_diff(
+    State(ctx): State<ServerCtx>,
+    Path(project_id): Path<String>,
+    Query(q): Query<DiffQuery>,
+) -> Result<Json<Value>, Response> {
+    let path = project_path_for(&ctx, &project_id).await?;
+    let diff = handoff::git_diff_range(&path, &q.from, &q.to)
+        .map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(Json(json!({ "from": q.from, "to": q.to, "diff": diff })))
+}
+
+#[derive(Deserialize)]
+struct BroadcastBody {
+    prompt: String,
+}
+
+async fn broadcast_prompt(
+    State(ctx): State<ServerCtx>,
+    Path(project_id): Path<String>,
+    Json(body): Json<BroadcastBody>,
+) -> Result<Json<Value>, Response> {
+    let prompt = body.prompt.trim();
+    if prompt.is_empty() {
+        return Err(api_err(StatusCode::BAD_REQUEST, "prompt is required"));
+    }
+    if !ctx
+        .state
+        .projects
+        .read()
+        .await
+        .contains_key(&project_id)
+    {
+        return Err(api_err(StatusCode::NOT_FOUND, "Project not found"));
+    }
+
+    let instance_ids: Vec<String> = ctx
+        .state
+        .instances
+        .read()
+        .await
+        .iter()
+        .filter_map(|(id, inst)| {
+            if inst.get("project_id").and_then(|v| v.as_str()) == Some(project_id.as_str()) {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let total = instance_ids.len();
+    let mut sent = 0u32;
+    for id in instance_ids {
+        if send_prompt_to_instance(&ctx.state, &id, prompt).await {
+            sent += 1;
+        }
+    }
+
+    Ok(Json(json!({ "status": "ok", "sent": sent, "total": total })))
+}
+
+async fn project_resources(
+    State(ctx): State<ServerCtx>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    if !ctx
+        .state
+        .projects
+        .read()
+        .await
+        .contains_key(&project_id)
+    {
+        return Err(api_err(StatusCode::NOT_FOUND, "Project not found"));
+    }
+
+    use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+    let mut sys = System::new_with_specifics(
+        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+    );
+    sys.refresh_memory();
+    let total_mb = sys.total_memory() as f64 / (1024.0 * 1024.0);
+    let used_mb = sys.used_memory() as f64 / (1024.0 * 1024.0);
+    let ram_percent = if total_mb > 0.0 {
+        used_mb / total_mb * 100.0
+    } else {
+        0.0
+    };
+
+    let instances_map = ctx.state.instances.read().await;
+    let pty_sessions = ctx.state.pty_sessions.read().await;
+    let project = ctx.state.projects.read().await.get(&project_id).cloned();
+    let project_state = project
+        .as_ref()
+        .and_then(|p| p.get("state").and_then(|v| v.as_str()))
+        .unwrap_or("active")
+        .to_string();
+
+    let project_instances: Vec<(String, Value)> = instances_map
+        .iter()
+        .filter_map(|(id, inst)| {
+            if inst.get("project_id").and_then(|v| v.as_str()) == Some(project_id.as_str()) {
+                Some((id.clone(), inst.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+    drop(instances_map);
+    drop(project);
+
+    let docker = get_docker(&ctx).await.ok();
+    let mut instance_rows = Vec::new();
+    for (index, (instance_id, inst)) in project_instances.iter().enumerate() {
+        let zeros = json!({
+            "mem_used_mb": 0.0,
+            "mem_limit_mb": 0.0,
+            "cpu_percent": 0.0,
+        });
+        let stats = if let Some(d) = docker.as_ref() {
+            if let Some(cid) = inst
+                .get("container_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                d.get_container_stats(cid).await
+            } else {
+                zeros
+            }
+        } else {
+            zeros
+        };
+        instance_rows.push(json!({
+            "instance_id": instance_id,
+            "label": format!("Terminal {}", index + 1),
+            "sandbox_mode": inst.get("sandbox_mode"),
+            "connected": pty_sessions.contains_key(instance_id),
+            "stats": stats,
+        }));
+    }
+    drop(pty_sessions);
+
+    Ok(Json(json!({
+        "system": {
+            "ram_used_mb": used_mb,
+            "ram_total_mb": total_mb,
+            "ram_percent": ram_percent,
+            "suspend_threshold_percent": RAM_SUSPEND_THRESHOLD,
+            "emergency_threshold_percent": RAM_EMERGENCY_THRESHOLD,
+        },
+        "project": {
+            "state": project_state,
+            "instance_count": instance_rows.len(),
+        },
+        "instances": instance_rows,
+    })))
+}
+
 async fn ws_pty(
     ws: WebSocketUpgrade,
     Path(instance_id): Path<String>,
@@ -771,7 +1052,7 @@ async fn ws_pty(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    init_tracing();
     let cli = Cli::parse();
 
     let state = AppState::new();
@@ -784,13 +1065,13 @@ async fn main() -> anyhow::Result<()> {
         Ok(runtime) => {
             let arc = Arc::new(runtime);
             let removed = arc.cleanup_orphans().await;
-            info!("[startup] removed {removed} orphaned sandbox container(s)");
+            tracing::debug!("[startup] removed {removed} orphaned sandbox container(s)");
             let removed_nss = arc.cleanup_nss_temp_dirs().await;
-            info!("[startup] removed {removed_nss} stale nss temp dir(s)");
+            tracing::debug!("[startup] removed {removed_nss} stale nss temp dir(s)");
             *docker_slot.write().await = Some(arc);
         }
         Err(e) => {
-            info!("[startup] Docker unavailable; skipping container cleanup: {e}");
+            tracing::debug!("[startup] Docker unavailable; skipping container cleanup: {e}");
         }
     }
     governor::spawn_governor(state.clone(), docker_slot.clone());
@@ -825,12 +1106,40 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/instances/{instance_id}/stats", get(instance_stats))
         .route("/api/instances/{instance_id}/focus", post(focus_instance))
         .route("/api/handoff", post(execute_handoff))
+        .route(
+            "/api/projects/{project_id}/handoffs/diff",
+            get(diff_project_handoffs),
+        )
+        .route(
+            "/api/projects/{project_id}/handoffs/export",
+            get(export_project_handoffs),
+        )
+        .route(
+            "/api/projects/{project_id}/handoffs/{filename}",
+            get(get_project_handoff_file),
+        )
+        .route(
+            "/api/projects/{project_id}/handoffs",
+            get(list_project_handoffs),
+        )
+        .route(
+            "/api/projects/{project_id}/git-diff",
+            get(project_git_diff),
+        )
+        .route(
+            "/api/projects/{project_id}/resources",
+            get(project_resources),
+        )
+        .route(
+            "/api/projects/{project_id}/broadcast",
+            post(broadcast_prompt),
+        )
         .route("/ws/pty/{instance_id}", get(ws_pty))
         .with_state(ctx)
         .layer(cors);
 
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
-    info!("handover-backend (rust) listening on http://{addr}");
+    tracing::debug!("handover-backend listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())

@@ -1,12 +1,12 @@
 # handover_rust
 
-Rust backend for Handover — replaces the Python FastAPI server.
+Rust backend for Handover.
 
 ## Features
 
-- REST API matching the Electron UI (`/api/projects`, `/api/instances`, `/api/handoff`, …)
+- REST API matching the desktop UI (`/api/projects`, `/api/instances`, `/api/handoff`, …)
 - WebSocket PTY bridge (`/ws/pty/{instance_id}`)
-- Docker sandbox lifecycle via [bollard](https://github.com/fussybeaver/bollard)
+- Docker sandbox lifecycle via [bollard](https://github.com/fussybeaver/bollard) (`handover-base:latest` from `../handover/docker/`)
 - Git + summary handoffs
 - Resource governor (pauses containers when RAM is high)
 
@@ -25,16 +25,16 @@ Binary: `target/release/handover-backend`
 cargo run -- --host 127.0.0.1 --port 8765
 ```
 
-## Electron integration
+## Tauri integration
 
-`handover_app` spawns this binary automatically:
+`handover_app` spawns this binary as a Tauri **sidecar**:
 
-- **Dev:** `target/debug/handover-backend`, or `cargo run` if not built yet
-- **Packaged:** `extraResources` bundles `target/release/handover-backend`
+- **Dev:** `src-tauri/binaries/handover-backend-<target-triple>` (via `scripts/prepare-backend-sidecar.sh`)
+- **Release:** bundled as `externalBin` in the AppImage
 
-Build the release binary before `npm run build` in `handover_app`:
+Build the release binary before `npm run build:tauri`:
 
 ```bash
 cd handover_rust && cargo build --release
-cd ../handover_app && npm run build
+cd ../handover_app && npm run build:tauri
 ```

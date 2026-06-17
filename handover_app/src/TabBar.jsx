@@ -30,6 +30,9 @@ export default function TabBar({
   onFocusInstance,
   onStopInstance,
   onOpenHandover,
+  onOpenHandoffHistory,
+  onOpenResources,
+  onOpenBroadcast,
 }) {
   const [showCreateMenu, setShowCreateMenu] = useState(false)
 
@@ -87,6 +90,36 @@ export default function TabBar({
       </div>
 
       <div className="relative my-0.5 flex shrink-0 items-center gap-1 self-center">
+        {focusedProject && instances.length > 0 ? (
+          <>
+            <button
+              type="button"
+              title="View system RAM and terminal resource usage"
+              onClick={onOpenResources}
+              className="rounded-sm border border-[#333333] bg-[#1e1e1e] px-2 py-1 text-[11px] font-medium text-[#cccccc] hover:bg-[#2a2d2e]"
+            >
+              Resources
+            </button>
+            <button
+              type="button"
+              title="Send a prompt to all project terminals"
+              onClick={onOpenBroadcast}
+              className="rounded-sm border border-[#333333] bg-[#1e1e1e] px-2 py-1 text-[11px] font-medium text-[#cccccc] hover:bg-[#2a2d2e]"
+            >
+              Broadcast
+            </button>
+          </>
+        ) : null}
+        {focusedProject ? (
+          <button
+            type="button"
+            title="View handoff history and preview latest.md"
+            onClick={onOpenHandoffHistory}
+            className="rounded-sm border border-[#333333] bg-[#1e1e1e] px-2 py-1 text-[11px] font-medium text-[#cccccc] hover:bg-[#2a2d2e]"
+          >
+            Handoffs
+          </button>
+        ) : null}
         {instances.length >= 2 ? (
           <button
             type="button"
@@ -94,7 +127,7 @@ export default function TabBar({
             onClick={onOpenHandover}
             className="rounded-sm border border-[#333333] bg-[#1e1e1e] px-2 py-1 text-[11px] font-medium text-[#cccccc] hover:bg-[#2a2d2e]"
           >
-            ↔ Handover
+            Handover
           </button>
         ) : null}
         <button

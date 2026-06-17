@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 pub const DEFAULT_MEM_LIMIT: &str = "2g";
 pub const SANDBOX_MODES: &[&str] = &["docker", "native"];
 pub const HANDOFF_METHODS: &[&str] = &["git", "summary"];
+pub const HANDOFF_TEMPLATES: &[&str] = &["generic", "nextjs", "rust-cli"];
 
 pub const GOVERNOR_INTERVAL_SECS: u64 = 15;
 pub const RAM_SUSPEND_THRESHOLD: f32 = 85.0;
@@ -141,6 +142,7 @@ pub fn default_project_config(path: &str) -> Value {
         "sandbox_mode": "docker",
         "mem_limit": DEFAULT_MEM_LIMIT,
         "handoff_method": "summary",
+        "handoff_template": "generic",
         "custom_env_vars": {},
     })
 }

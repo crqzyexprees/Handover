@@ -3,6 +3,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import { WebglAddon } from '@xterm/addon-webgl'
 import '@xterm/xterm/css/xterm.css'
+import { getBackendWsUrl } from './platform.js'
 import { getInstanceStats } from './api'
 
 const STATS_POLL_MS = 5000
@@ -124,9 +125,7 @@ export default function TerminalView({ instanceId, isActive, onConnectionChange 
 
       reportConnection('connecting')
 
-      const urlParams = new URLSearchParams(window.location.search)
-      const port = urlParams.get('port') || '8765'
-      const wsUrl = `ws://127.0.0.1:${port}/ws/pty/${encodeURIComponent(instanceId)}`
+      const wsUrl = getBackendWsUrl(`/ws/pty/${encodeURIComponent(instanceId)}`)
       ws = new WebSocket(wsUrl)
       ws.binaryType = 'arraybuffer'
 

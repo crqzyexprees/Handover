@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { pickDirectory } from './platform.js'
 import {
   getInstanceId,
   getProjectConfig,
@@ -135,7 +136,7 @@ export default function Sidebar({
   const [pendingProjectPath, setPendingProjectPath] = useState(null)
 
   const openDirectoryPicker = useCallback(async () => {
-    const path = await window.electronAPI.pickDirectory()
+    const path = await pickDirectory()
     if (path == null) return
     const trimmed = path.trim()
     if (!trimmed) return

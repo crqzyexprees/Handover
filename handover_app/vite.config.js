@@ -5,12 +5,11 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   base: './',
+  clearScreen: false,
   server: {
-    // Bind IPv4 explicitly. Vite otherwise resolves "localhost" to IPv6
-    // (::1) on some systems, which breaks the dev:electron wait-on check
-    // (tcp:127.0.0.1:5173) and Electron's VITE_DEV_SERVER_URL.
-    host: '127.0.0.1',
+    host: process.env.TAURI_DEV_HOST || '127.0.0.1',
     port: 5173,
     strictPort: true,
   },
+  envPrefix: ['VITE_', 'TAURI_'],
 })

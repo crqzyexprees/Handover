@@ -1,64 +1,70 @@
 # Handover App
 
-Electron + React desktop app for Handover.
+Tauri 2 + React desktop app for Handover.
 
-This package owns the desktop shell, React UI, xterm.js terminals, Vite build,
-and Electron packaging. The active backend is the Rust service in
-`../handover_rust`.
+The UI talks to the Rust backend in `../handover_rust`, which Tauri starts as a **sidecar** process (`handover-backend`) on a dynamic localhost port.
 
 ## Development
 
+From the **repo root**:
+
 ```bash
 npm install
-npm run dev:electron
+npm run dev:tauri
 ```
 
-`npm run dev:electron` starts Vite, then launches Electron with
-`HANDOVER_BACKEND=rust`. Electron starts the Rust backend on a free localhost
-port and passes that port to the renderer.
+`dev:tauri` (via `scripts/dev-tauri.sh`):
 
-## Handoff Workflow
+1. Builds `handover-backend` (debug)
+2. Copies it to `src-tauri/binaries/handover-backend-<target-triple>`
+3. Generates placeholder icons if missing
+4. Runs `tauri dev`
 
-Open a project, start at least two terminals, and run your AI CLI sessions in
-those terminals. The handoff modal supports two methods:
+## Project layout
 
-- `AI-written Summary File`: prompts the source AI terminal to write
-  `.handover/handoffs/latest.md` plus the next numbered history file, then
-  waits up to 60 seconds before prompting the target terminal to read
-  `latest.md` and continue. This is the default for day-to-day AI handoffs.
-- `Git Commit`: creates a checkpoint commit when the worktree has changes, then
-  prompts the target terminal to inspect the latest commit. Use this when you
-  want team-facing history or a review checkpoint.
+| Path | Purpose |
+|------|---------|
+| `src/` | React UI (terminals, handoffs, settings) |
+| `src/platform.js` | Tauri dialog + backend port/URL helpers |
+| `src-tauri/` | Tauri shell (sidecar spawn, `get_backend_port`) |
+| `scripts/` | Sidecar prep, icons, dev wrapper |
 
-For summary handoffs, the user only needs to enter the goal or next direction.
-The source AI writes the detailed transfer context because it has the active
-conversation state. If the file is not created before the timeout, Handover
-writes a fallback file with the user-provided goal and does not prompt the
-target terminal.
+## Handoff workflow
 
-## Python Backend Fallback
+Open a project, start at least two terminals, and run your AI CLI sessions. The handoff modal supports:
 
-The old Python backend lives in `../handover_python`. To run the desktop app
-against it:
+- **Summary File** — source AI writes `.handover/handoffs/latest.md`; backend waits up to 60s, then prompts the target.
+- **Git Commit** — checkpoint commit, then prompts the target to inspect history.
+
+Configure templates (`generic`, `nextjs`, `rust-cli`) in `.handover/config.yml` via Project Settings.
+
+## Docker sandbox image
 
 ```bash
-cd ../handover_python
-python -m venv venv
-./venv/bin/pip install -r requirements.txt
-
-cd ../handover_app
-npm run dev:electron:python
+../handover/docker/build-base.sh
+# or from repo root: npm run build:docker-base
 ```
 
-## Build
+## Build AppImage
+
+From the repo root:
 
 ```bash
-npm run build:backend
-npm run build
+npm run build:tauri
 ```
 
-`build:backend` builds `../handover_rust/target/release/handover-backend`.
-Electron-builder bundles that binary into the packaged app under
-`resources/backend/handover-backend`.
+Builds icons → release backend → sidecar bundle → AppImage. Output under `src-tauri/target/release/bundle/`.
 
-Build output lands in `handover_app/release/`.
+## Browser-only dev
+
+```bash
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`. API defaults to port `8765` unless you pass `?port=`. No native folder picker.
+
+Start the backend separately for full functionality:
+
+```bash
+cd ../handover_rust && cargo run -- --host 127.0.0.1 --port 8765
+```

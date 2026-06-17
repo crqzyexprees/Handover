@@ -1,0 +1,18 @@
+{
+  "name": "handover-repo",
+  "private": true,
+  "description": "Handover monorepo root — app lives in handover_app/",
+  "workspaces": [
+    "handover_app"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w handover",
+    "dev:tauri": "npm run dev:tauri -w handover",
+    "build": "npm run build -w handover",
+    "build:tauri": "npm run build:tauri -w handover",
+    "build:backend": "npm run build:backend -w handover",
+    "build:docker-base": "npm run build:docker-base -w handover",
+    "lint": "npm run lint -w handover",
+    "preview": "npm run preview -w handover"
+  }
+}

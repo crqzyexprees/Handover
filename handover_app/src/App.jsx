@@ -7,6 +7,9 @@ import {
   getProjectInstances,
 } from './projectUtils.js'
 import HandoverModal from './HandoverModal.jsx'
+import HandoffHistoryPanel from './HandoffHistoryPanel.jsx'
+import BroadcastModal from './BroadcastModal.jsx'
+import ResourceDashboardPanel from './ResourceDashboardPanel.jsx'
 import ProjectSettings from './ProjectSettings.jsx'
 import Sidebar from './Sidebar.jsx'
 import TabBar from './TabBar.jsx'
@@ -17,6 +20,7 @@ const DEFAULT_PROJECT_CONFIG = {
   sandbox_mode: 'docker',
   mem_limit: '2g',
   handoff_method: 'summary',
+  handoff_template: 'generic',
   custom_env_vars: {},
 }
 
@@ -66,6 +70,9 @@ export default function App() {
   const [focusedInstanceId, setFocusedInstanceId] = useState(null)
   const [toasts, setToasts] = useState([])
   const [handoverOpen, setHandoverOpen] = useState(false)
+  const [handoffHistoryOpen, setHandoffHistoryOpen] = useState(false)
+  const [resourcesOpen, setResourcesOpen] = useState(false)
+  const [broadcastOpen, setBroadcastOpen] = useState(false)
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false)
   const [settingsProjectId, setSettingsProjectId] = useState(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
@@ -278,6 +285,16 @@ export default function App() {
     }
     setFocusedProjectId(projectId)
     const refreshed = await refreshProjects()
+    const { data: configData } = await api.getProjectConfig(projectId)
+    if (configData && typeof configData === 'object') {
+      setProjects((prev) =>
+        prev.map((project) =>
+          String(getProjectId(project) ?? '') === projectId
+            ? { ...project, config: configData }
+            : project,
+        ),
+      )
+    }
     const selectedProject = refreshed?.find(
       (p) => String(getProjectId(p)) === projectId,
     )
@@ -506,6 +523,8 @@ export default function App() {
       sandbox_mode: config?.sandbox_mode ?? DEFAULT_PROJECT_CONFIG.sandbox_mode,
       mem_limit: config?.mem_limit ?? DEFAULT_PROJECT_CONFIG.mem_limit,
       handoff_method: config?.handoff_method ?? DEFAULT_PROJECT_CONFIG.handoff_method,
+      handoff_template:
+        config?.handoff_template ?? DEFAULT_PROJECT_CONFIG.handoff_template,
       custom_env_vars:
         config?.custom_env_vars && typeof config.custom_env_vars === 'object'
           ? config.custom_env_vars
@@ -547,18 +566,20 @@ export default function App() {
           />
         </div>
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-          {!sidebarOpen ? (
-            <button
-              type="button"
-              title="Show projects sidebar"
-              onClick={() => setSidebarOpen(true)}
-              className="absolute left-0 top-0 z-20 flex h-9 w-8 items-center justify-center border-r border-b border-[#333333] bg-[#181818] text-[#808080] hover:bg-[#2a2d2e] hover:text-[#cccccc]"
-            >
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
-                <path d="M2 2.5h5.5v11H2V2.5zm6.5 0H14v11H8.5V2.5z" opacity="0.9" />
-              </svg>
-            </button>
-          ) : null}
+          <div className="flex shrink-0 items-stretch">
+            {!sidebarOpen ? (
+              <button
+                type="button"
+                title="Show projects sidebar"
+                onClick={() => setSidebarOpen(true)}
+                className="flex h-10 w-8 shrink-0 items-center justify-center border-r border-b border-[#333333] bg-[#252526] text-[#808080] hover:bg-[#2a2d2e] hover:text-[#cccccc]"
+              >
+                <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden>
+                  <path d="M2 2.5h5.5v11H2V2.5zm6.5 0H14v11H8.5V2.5z" opacity="0.9" />
+                </svg>
+              </button>
+            ) : null}
+            <div className="min-w-0 flex-1">
         <TabBar
           focusedProject={focusedProject}
           focusedInstanceId={focusedInstanceId}
@@ -567,7 +588,12 @@ export default function App() {
           onFocusInstance={handleFocusInstance}
           onStopInstance={handleStopInstance}
           onOpenHandover={() => setHandoverOpen(true)}
+          onOpenHandoffHistory={() => setHandoffHistoryOpen(true)}
+          onOpenResources={() => setResourcesOpen(true)}
+          onOpenBroadcast={() => setBroadcastOpen(true)}
         />
+            </div>
+          </div>
         <div className="flex min-h-0 min-w-0 flex-1">
           {allInstances.map((instance) => (
             <TerminalView
@@ -597,6 +623,25 @@ export default function App() {
         }
         onClose={() => setHandoverOpen(false)}
         onExecute={handleExecuteHandover}
+      />
+      <HandoffHistoryPanel
+        open={handoffHistoryOpen}
+        projectId={focusedProjectId}
+        projectName={getProjectDisplayName(focusedProject)}
+        onClose={() => setHandoffHistoryOpen(false)}
+      />
+      <ResourceDashboardPanel
+        open={resourcesOpen}
+        projectId={focusedProjectId}
+        onClose={() => setResourcesOpen(false)}
+      />
+      <BroadcastModal
+        key={`broadcast-${focusedProjectId ?? 'none'}-${broadcastOpen ? 'open' : 'closed'}`}
+        open={broadcastOpen}
+        projectId={focusedProjectId}
+        instances={getProjectInstances(focusedProject)}
+        ptyConnections={ptyConnections}
+        onClose={() => setBroadcastOpen(false)}
       />
       <ProjectSettings
         isOpen={isSettingsModalOpen}

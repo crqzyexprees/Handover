@@ -1,8 +1,7 @@
 import axios from 'axios'
+import { getBackendBaseUrl } from './platform.js'
 
-const urlParams = new URLSearchParams(window.location.search)
-const port = urlParams.get('port') || '8765'
-export const BASE_URL = `http://127.0.0.1:${port}`
+export const BASE_URL = getBackendBaseUrl()
 
 const client = axios.create({
   baseURL: BASE_URL,
@@ -138,6 +137,82 @@ export async function getInstanceStats(instanceId) {
   return request(async () => {
     const res = await client.get(
       `/api/instances/${encodeURIComponent(instanceId)}/stats`,
+    )
+    return res.data
+  })
+}
+
+export async function listHandoffFiles(projectId) {
+  return request(async () => {
+    const res = await client.get(
+      `/api/projects/${encodeURIComponent(projectId)}/handoffs`,
+    )
+    return res.data
+  })
+}
+
+export async function getHandoffFile(projectId, filename) {
+  return request(async () => {
+    const res = await client.get(
+      `/api/projects/${encodeURIComponent(projectId)}/handoffs/${encodeURIComponent(filename)}`,
+    )
+    return res.data
+  })
+}
+
+export async function exportHandoffLog(projectId) {
+  try {
+    const res = await client.get(
+      `/api/projects/${encodeURIComponent(projectId)}/handoffs/export`,
+      { responseType: 'text' },
+    )
+    return { data: res.data, error: null }
+  } catch (error) {
+    const err = axios.isAxiosError(error)
+      ? error.response?.data !== undefined
+        ? typeof error.response.data === 'object' && error.response.data !== null
+          ? { httpStatus: error.response.status, ...error.response.data }
+          : { httpStatus: error.response.status, detail: error.response.data }
+        : { message: error.message, httpStatus: error.response?.status }
+      : error
+    return { data: null, error: err }
+  }
+}
+
+export async function getProjectResources(projectId) {
+  return request(async () => {
+    const res = await client.get(
+      `/api/projects/${encodeURIComponent(projectId)}/resources`,
+    )
+    return res.data
+  })
+}
+
+export async function broadcastPrompt(projectId, prompt) {
+  return request(async () => {
+    const res = await client.post(
+      `/api/projects/${encodeURIComponent(projectId)}/broadcast`,
+      { prompt },
+    )
+    return res.data
+  })
+}
+
+export async function diffHandoffFiles(projectId, from, to) {
+  return request(async () => {
+    const res = await client.get(
+      `/api/projects/${encodeURIComponent(projectId)}/handoffs/diff`,
+      { params: { from, to } },
+    )
+    return res.data
+  })
+}
+
+export async function gitDiff(projectId, from, to) {
+  return request(async () => {
+    const res = await client.get(
+      `/api/projects/${encodeURIComponent(projectId)}/git-diff`,
+      { params: { from, to } },
     )
     return res.data
   })

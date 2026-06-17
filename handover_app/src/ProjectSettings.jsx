@@ -6,7 +6,29 @@ const DEFAULT_CONFIG = {
   sandbox_mode: 'docker',
   mem_limit: '2g',
   handoff_method: 'summary',
+  handoff_template: 'generic',
 }
+
+const HANDOFF_TEMPLATES = [
+  {
+    value: 'generic',
+    label: 'Generic',
+    description:
+      'Goal, context, files changed, commands run, tests/results, decisions, blockers, and next steps.',
+  },
+  {
+    value: 'nextjs',
+    label: 'Next.js',
+    description:
+      'App router routes, API routes, React components/hooks, env vars (.env.local), and npm/pnpm scripts.',
+  },
+  {
+    value: 'rust-cli',
+    label: 'Rust CLI',
+    description:
+      'Crates/modules changed, public APIs, cargo commands (build/test/clippy), test output, and CLI flags.',
+  },
+]
 
 const MEMORY_OPTIONS = ['512m', '1g', '2g', '4g']
 
@@ -112,6 +134,7 @@ export default function ProjectSettings({
           sandbox_mode: data?.sandbox_mode ?? DEFAULT_CONFIG.sandbox_mode,
           mem_limit: data?.mem_limit ?? DEFAULT_CONFIG.mem_limit,
           handoff_method: data?.handoff_method ?? DEFAULT_CONFIG.handoff_method,
+          handoff_template: data?.handoff_template ?? DEFAULT_CONFIG.handoff_template,
         })
         setCustomEnvVars(dictToCustomEnvVars(data?.custom_env_vars))
       }
@@ -261,6 +284,9 @@ export default function ProjectSettings({
             <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-[#808080]">
               Default Handover Method
             </div>
+            <p className="mb-3 text-xs text-[#808080]">
+              Saved to `.handover/config.yml` in the project repo for team sharing.
+            </p>
             <div className="mb-2">
               <label className="flex items-center gap-2 text-sm">
                 <input
@@ -297,6 +323,40 @@ export default function ProjectSettings({
               </p>
             </div>
           </section>
+
+          {config.handoff_method === 'summary' ? (
+            <section className="rounded border border-[#333333] p-3">
+              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-[#808080]">
+                Summary Handoff Template
+              </div>
+              <p className="mb-3 text-xs text-[#808080]">
+                Guides what the source AI includes when writing `.handover/handoffs/latest.md`.
+              </p>
+              <div className="space-y-3">
+                {HANDOFF_TEMPLATES.map((template) => (
+                  <div key={template.value}>
+                    <label className="flex items-center gap-2 text-sm">
+                      <input
+                        type="radio"
+                        name="handoff_template"
+                        checked={config.handoff_template === template.value}
+                        onChange={() =>
+                          setConfig((prev) => ({
+                            ...prev,
+                            handoff_template: template.value,
+                          }))
+                        }
+                      />
+                      {template.label}
+                    </label>
+                    <p className="mt-1 pl-5 text-xs text-[#808080]">
+                      {template.description}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
 
           <section className="rounded-lg border-2 border-[#3794ff]/40 bg-[#1e1e1e] p-4">
             <h3 className="mb-1 text-lg font-bold text-white">

@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-get-backend-port"
+description = "Enables the get_backend_port command."
+commands.allow = ["get_backend_port"]

@@ -15,9 +15,9 @@ if git diff --cached --quiet; then
   echo "Nothing to commit."
 else
   git commit -m "$(cat <<'EOF'
-Restructure Handover app and backends.
+Migrate desktop app from Electron to Tauri 2 with Rust sidecar.
 
-Split Electron app, Rust backend, and legacy Python backend into handover_app, handover_rust, and handover_python.
+Remove Python backend, add Tauri shell with dynamic port injection, handoff templates/history, resource dashboard, and broadcast prompts.
 EOF
 )"
 fi
