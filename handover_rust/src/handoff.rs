@@ -203,17 +203,16 @@ pub async fn list_handoff_files(project_path: &str) -> Result<Vec<HandoffFileInf
     }
 
     let mut entries = Vec::new();
-    let mut read_dir = fs::read_dir(&dir).await.context("failed to read handoffs dir")?;
+    let mut read_dir = fs::read_dir(&dir)
+        .await
+        .context("failed to read handoffs dir")?;
     while let Some(entry) = read_dir.next_entry().await? {
         let filename = entry.file_name().to_string_lossy().into_owned();
         if !filename.ends_with(".md") || !is_valid_handoff_filename(&filename) {
             continue;
         }
         let metadata = entry.metadata().await?;
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(system_time_to_rfc3339);
+        let modified = metadata.modified().ok().and_then(system_time_to_rfc3339);
         entries.push(HandoffFileInfo {
             is_latest: filename == "latest.md",
             filename,
@@ -379,13 +378,9 @@ mod tests {
             std::fs::write(&writer_path, "partial and done").unwrap();
         });
 
-        let ready = wait_for_latest_handoff(
-            &project_path,
-            None,
-            Duration::from_secs(6),
-        )
-        .await
-        .unwrap();
+        let ready = wait_for_latest_handoff(&project_path, None, Duration::from_secs(6))
+            .await
+            .unwrap();
 
         assert!(ready);
         let content = std::fs::read_to_string(latest_handoff_path(&project_path)).unwrap();

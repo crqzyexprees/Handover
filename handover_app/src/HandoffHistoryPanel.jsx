@@ -80,29 +80,37 @@ export default function HandoffHistoryPanel({
 
   useEffect(() => {
     if (!open || projectId == null) return
-    void loadList()
+    const timer = window.setTimeout(() => {
+      void loadList()
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [open, projectId, loadList])
 
   useEffect(() => {
     if (!open || projectId == null || selectedFilename == null || viewMode !== 'preview') {
       if (viewMode !== 'preview') return
-      setPreview('')
-      return
+      const timer = window.setTimeout(() => {
+        setPreview('')
+      }, 0)
+      return () => window.clearTimeout(timer)
     }
     let cancelled = false
-    setLoadingPreview(true)
-    void api.getHandoffFile(projectId, selectedFilename).then(({ data, error }) => {
-      if (cancelled) return
-      setLoadingPreview(false)
-      if (error) {
-        setPreview('')
-        setErrorText('Could not load handoff preview.')
-        return
-      }
-      setPreview(data?.content ?? '')
-    })
+    const timer = window.setTimeout(() => {
+      setLoadingPreview(true)
+      void api.getHandoffFile(projectId, selectedFilename).then(({ data, error }) => {
+        if (cancelled) return
+        setLoadingPreview(false)
+        if (error) {
+          setPreview('')
+          setErrorText('Could not load handoff preview.')
+          return
+        }
+        setPreview(data?.content ?? '')
+      })
+    }, 0)
     return () => {
       cancelled = true
+      window.clearTimeout(timer)
     }
   }, [open, projectId, selectedFilename, viewMode])
 
@@ -150,7 +158,10 @@ export default function HandoffHistoryPanel({
 
   useEffect(() => {
     if (!open || projectId == null || viewMode !== 'compare') return
-    void loadDiff()
+    const timer = window.setTimeout(() => {
+      void loadDiff()
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [open, projectId, viewMode, loadDiff])
 
   const handleExport = async () => {

@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "handover-desktop"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",

@@ -23,8 +23,6 @@ handover_app/node_modules
 handover_app/dist
 handover_app/dist-ssr
 handover_app/*.local
-handover_app/release
-handover_app/venv/
 
 # Rust stack (handover_rust)
 handover_rust/target/
@@ -33,12 +31,13 @@ handover_rust/target/
 handover_app/src-tauri/target/
 handover_app/src-tauri/binaries/
 
-# Legacy root paths (before reorganize.py)
+# Workspace root (npm workspaces)
 node_modules
 dist
 dist-ssr
 *.local
-release
+
+# Python build tooling (generate-icons.py)
 __pycache__/
 *.py[cod]
 
@@ -50,8 +49,3 @@ __pycache__/
 # Runtime handoff data inside user projects
 .handover/
 .ai-orchestrator/
-
-# Migration helpers
-_reorganize.sh
-_reorganize.done
-_shell_test.txt

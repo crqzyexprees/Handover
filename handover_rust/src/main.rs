@@ -31,8 +31,7 @@ use crate::state::{
 };
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -811,10 +810,7 @@ async fn execute_handoff(
     Ok(Json(json!({ "status": "ok", "message": handoff_message })).into_response())
 }
 
-async fn project_path_for(
-    ctx: &ServerCtx,
-    project_id: &str,
-) -> Result<String, Response> {
+async fn project_path_for(ctx: &ServerCtx, project_id: &str) -> Result<String, Response> {
     ctx.state
         .projects
         .read()
@@ -844,7 +840,10 @@ async fn export_project_handoffs(
         .await
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok((
-        [(axum::http::header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/markdown; charset=utf-8",
+        )],
         markdown,
     ))
 }
@@ -906,13 +905,7 @@ async fn broadcast_prompt(
     if prompt.is_empty() {
         return Err(api_err(StatusCode::BAD_REQUEST, "prompt is required"));
     }
-    if !ctx
-        .state
-        .projects
-        .read()
-        .await
-        .contains_key(&project_id)
-    {
+    if !ctx.state.projects.read().await.contains_key(&project_id) {
         return Err(api_err(StatusCode::NOT_FOUND, "Project not found"));
     }
 
@@ -939,20 +932,16 @@ async fn broadcast_prompt(
         }
     }
 
-    Ok(Json(json!({ "status": "ok", "sent": sent, "total": total })))
+    Ok(Json(
+        json!({ "status": "ok", "sent": sent, "total": total }),
+    ))
 }
 
 async fn project_resources(
     State(ctx): State<ServerCtx>,
     Path(project_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
-    if !ctx
-        .state
-        .projects
-        .read()
-        .await
-        .contains_key(&project_id)
-    {
+    if !ctx.state.projects.read().await.contains_key(&project_id) {
         return Err(api_err(StatusCode::NOT_FOUND, "Project not found"));
     }
 
@@ -1122,10 +1111,7 @@ async fn main() -> anyhow::Result<()> {
             "/api/projects/{project_id}/handoffs",
             get(list_project_handoffs),
         )
-        .route(
-            "/api/projects/{project_id}/git-diff",
-            get(project_git_diff),
-        )
+        .route("/api/projects/{project_id}/git-diff", get(project_git_diff))
         .route(
             "/api/projects/{project_id}/resources",
             get(project_resources),

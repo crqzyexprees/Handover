@@ -82,11 +82,16 @@ export default function ResourceDashboardPanel({ open, projectId, onClose }) {
 
   useEffect(() => {
     if (!open || projectId == null) return
-    void loadResources()
+    const initialTimer = window.setTimeout(() => {
+      void loadResources()
+    }, 0)
     const timer = window.setInterval(() => {
       void loadResources()
     }, POLL_MS)
-    return () => window.clearInterval(timer)
+    return () => {
+      window.clearTimeout(initialTimer)
+      window.clearInterval(timer)
+    }
   }, [open, projectId, loadResources])
 
   if (!open) return null
