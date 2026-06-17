@@ -132,3 +132,7 @@ HANDOVER_VERBOSE=1 RUST_LOG=info npm run dev:tauri
 | `npm run build:backend` | Rust release binary only |
 | `npm run build:docker-base` | Build `handover-base:latest` image |
 | `npm run lint` | ESLint on frontend |
+
+## License
+
+Handover is open source under the [Apache License 2.0](LICENSE).
