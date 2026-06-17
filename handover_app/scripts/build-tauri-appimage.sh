@@ -11,7 +11,7 @@ APPIMAGE_PATH="$BUNDLE_DIR/$APPIMAGE_NAME"
 
 npm run icons
 npm run build:backend
-npm run prepare:sidecar:release
+node scripts/prepare-backend-sidecar.js release
 
 if tauri build; then
   exit 0
