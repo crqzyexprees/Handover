@@ -14,6 +14,7 @@ import ProjectSettings from './ProjectSettings.jsx'
 import Sidebar from './Sidebar.jsx'
 import TabBar from './TabBar.jsx'
 import TerminalView from './TerminalView.jsx'
+import TitleBar from './TitleBar.jsx'
 
 const DEFAULT_PROJECT_CONFIG = {
   project_name: '',
@@ -547,6 +548,7 @@ export default function App() {
 
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-[#1e1e1e] text-[#cccccc]">
+      <TitleBar />
       <div className="flex min-h-0 min-w-0 flex-1">
         <div
           className={`relative shrink-0 overflow-hidden border-r border-[#333333] transition-[width] duration-200 ease-in-out ${
