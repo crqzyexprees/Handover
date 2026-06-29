@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -7,12 +8,24 @@ use axum::extract::ws::{Message, Utf8Bytes, WebSocket};
 use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 use serde::Deserialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tracing::warn;
 
-use crate::state::{AppState, PtySession};
+use crate::state::{AppState, PtySession, SharedPty, WsAttachment};
 
 const CONTROL_PREFIX: &str = "__handover_control__:";
+const PTY_OUTPUT_CAPACITY: usize = 256;
+static WS_ATTACH_ID: AtomicU64 = AtomicU64::new(1);
+
+async fn attachment_is_active(state: &AppState, instance_id: &str, attach_id: u64) -> bool {
+    state
+        .ws_attachments
+        .read()
+        .await
+        .get(instance_id)
+        .map(|attachment| attachment.attach_id)
+        == Some(attach_id)
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -86,42 +99,160 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         return;
     }
 
-    if let Some(existing) = state.pty_sessions.write().await.remove(&instance_id) {
-        close_existing_session(&existing);
-    }
+    detach_ws_attachment(&state, &instance_id).await;
 
-    let (input_tx, input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (close_tx, mut close_rx) = oneshot::channel::<()>();
-    state.pty_sessions.write().await.insert(
-        instance_id.clone(),
-        PtySession {
-            input_tx,
-            close_tx: Arc::new(std::sync::Mutex::new(Some(close_tx))),
-        },
-    );
-
-    let pty_spawn = tokio::task::spawn_blocking(move || {
-        spawn_pty_child(&sandbox_mode, container_id.as_deref(), cwd.as_deref())
-    })
-    .await;
-
-    let pty = match pty_spawn {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
+    let shared = match ensure_shared_pty(
+        &state,
+        &instance_id,
+        &sandbox_mode,
+        container_id.as_deref(),
+        cwd.as_deref(),
+    )
+    .await
+    {
+        Ok(core) => core,
+        Err(e) => {
             warn!("pty spawn failed: {e}");
             send_error(&mut socket_tx, &format!("Failed to start shell: {e}")).await;
-            state.pty_sessions.write().await.remove(&instance_id);
-            return;
-        }
-        Err(e) => {
-            warn!("pty task failed: {e}");
-            send_error(&mut socket_tx, &format!("Failed to start shell task: {e}")).await;
-            state.pty_sessions.write().await.remove(&instance_id);
             return;
         }
     };
 
-    let (pty_out_tx, mut pty_out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let attach_id = WS_ATTACH_ID.fetch_add(1, Ordering::SeqCst);
+    let (detach_tx, mut detach_rx) = oneshot::channel::<()>();
+    state.ws_attachments.write().await.insert(
+        instance_id.clone(),
+        WsAttachment {
+            attach_id,
+            detach_tx,
+        },
+    );
+
+    let input_tx = shared.input_tx.clone();
+    let master = shared.master.clone();
+    let mut output_rx = shared.output_tx.subscribe();
+    let state_for_output = state.clone();
+    let instance_id_for_output = instance_id.clone();
+
+    let (mut ws_tx, mut ws_rx) = (socket_tx, socket_rx);
+
+    let ws_write = tokio::spawn(async move {
+        loop {
+            if !attachment_is_active(&state_for_output, &instance_id_for_output, attach_id).await {
+                break;
+            }
+            match output_rx.recv().await {
+                Ok(data) => {
+                    if !attachment_is_active(&state_for_output, &instance_id_for_output, attach_id)
+                        .await
+                    {
+                        break;
+                    }
+                    if ws_tx.send(Message::Binary(data.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            _ = &mut detach_rx => break,
+            msg = ws_rx.next() => {
+                let Some(Ok(msg)) = msg else {
+                    break;
+                };
+                match msg {
+                    Message::Text(text) => {
+                        if !attachment_is_active(&state, &instance_id, attach_id).await {
+                            break;
+                        }
+                        if let Some(control) = text.strip_prefix(CONTROL_PREFIX) {
+                            handle_control_message(control, &master);
+                            continue;
+                        }
+                        let _ = input_tx.send(text.as_bytes().to_vec());
+                    }
+                    Message::Binary(data) => {
+                        if !attachment_is_active(&state, &instance_id, attach_id).await {
+                            break;
+                        }
+                        let _ = input_tx.send(data.to_vec());
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    ws_write.abort();
+    let mut attachments = state.ws_attachments.write().await;
+    if attachments
+        .get(&instance_id)
+        .is_some_and(|attachment| attachment.attach_id == attach_id)
+    {
+        attachments.remove(&instance_id);
+    }
+}
+
+pub async fn shutdown_instance_pty(state: &AppState, instance_id: &str) {
+    detach_ws_attachment(state, instance_id).await;
+
+    let core = state.pty_cores.write().await.remove(instance_id);
+    state.pty_sessions.write().await.remove(instance_id);
+
+    if let Some(core) = core {
+        shutdown_shared_pty(core).await;
+    }
+}
+
+async fn detach_ws_attachment(state: &AppState, instance_id: &str) {
+    if let Some(attachment) = state.ws_attachments.write().await.remove(instance_id) {
+        let _ = attachment.detach_tx.send(());
+    }
+}
+
+async fn ensure_shared_pty(
+    state: &AppState,
+    instance_id: &str,
+    sandbox_mode: &str,
+    container_id: Option<&str>,
+    cwd: Option<&std::path::Path>,
+) -> anyhow::Result<Arc<SharedPty>> {
+    if let Some(existing) = state.pty_cores.read().await.get(instance_id) {
+        return Ok(existing.clone());
+    }
+
+    let create_lock = {
+        let mut locks = state.pty_create_locks.lock().await;
+        locks
+            .entry(instance_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _create_guard = create_lock.lock().await;
+
+    if let Some(existing) = state.pty_cores.read().await.get(instance_id) {
+        return Ok(existing.clone());
+    }
+
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (output_tx, _) = broadcast::channel(PTY_OUTPUT_CAPACITY);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+    let sandbox_mode = sandbox_mode.to_string();
+    let container_id = container_id.map(String::from);
+    let cwd = cwd.map(|path| path.to_path_buf());
+
+    let pty = tokio::task::spawn_blocking(move || {
+        spawn_pty_child(&sandbox_mode, container_id.as_deref(), cwd.as_deref())
+    })
+    .await??;
+
     let PtyHandles {
         reader,
         writer,
@@ -129,6 +260,7 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         child,
     } = pty;
     let master = Arc::new(std::sync::Mutex::new(master));
+    let output_tx_reader = output_tx.clone();
 
     tokio::task::spawn_blocking(move || {
         let mut reader = reader;
@@ -137,7 +269,7 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if pty_out_tx.send(buf[..n].to_vec()).is_err() {
+                    if output_tx_reader.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                 }
@@ -148,7 +280,6 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
 
     tokio::task::spawn_blocking(move || {
         let mut writer = writer;
-        let mut input_rx = input_rx;
         while let Some(data) = input_rx.blocking_recv() {
             if writer.write_all(&data).is_err() {
                 break;
@@ -156,63 +287,39 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         }
     });
 
-    let (mut ws_tx, mut ws_rx) = (socket_tx, socket_rx);
-
-    let ws_write = tokio::spawn(async move {
-        while let Some(data) = pty_out_rx.recv().await {
-            let text = String::from_utf8_lossy(&data).into_owned();
-            if ws_tx
-                .send(Message::Text(Utf8Bytes::from(text)))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
+    let core = Arc::new(SharedPty {
+        input_tx: input_tx.clone(),
+        output_tx,
+        shutdown_tx: Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
+        master: master.clone(),
     });
 
-    loop {
-        tokio::select! {
-            _ = &mut close_rx => break,
-            msg = ws_rx.next() => {
-                let Some(Ok(msg)) = msg else {
-                    break;
-                };
-                match msg {
-                    Message::Text(text) => {
-                        if let Some(control) = text.strip_prefix(CONTROL_PREFIX) {
-                            handle_control_message(control, &master);
-                            continue;
-                        }
-                        if let Some(session) = state.pty_sessions.read().await.get(&instance_id) {
-                            let _ = session.input_tx.send(text.as_bytes().to_vec());
-                        }
-                    }
-                    Message::Binary(data) => {
-                        if let Some(session) = state.pty_sessions.read().await.get(&instance_id) {
-                            let _ = session.input_tx.send(data.to_vec());
-                        }
-                    }
-                    Message::Close(_) => break,
-                    _ => {}
-                }
-            }
-        }
-    }
+    state
+        .pty_cores
+        .write()
+        .await
+        .insert(instance_id.to_string(), core.clone());
+    state
+        .pty_sessions
+        .write()
+        .await
+        .insert(instance_id.to_string(), PtySession { input_tx });
 
-    ws_write.abort();
-    state.pty_sessions.write().await.remove(&instance_id);
-    tokio::task::spawn_blocking(move || {
-        let mut child = child;
-        let _ = child.kill();
+    tokio::spawn(async move {
+        let _ = shutdown_rx.await;
+        tokio::task::spawn_blocking(move || {
+            let mut child = child;
+            let _ = child.kill();
+        });
     });
-    drop(master);
+
+    Ok(core)
 }
 
-fn close_existing_session(session: &PtySession) {
-    if let Ok(mut close_tx) = session.close_tx.lock() {
-        if let Some(close_tx) = close_tx.take() {
-            let _ = close_tx.send(());
+async fn shutdown_shared_pty(core: Arc<SharedPty>) {
+    if let Ok(mut shutdown_tx) = core.shutdown_tx.lock() {
+        if let Some(tx) = shutdown_tx.take() {
+            let _ = tx.send(());
         }
     }
 }
@@ -265,7 +372,6 @@ fn spawn_pty_child(
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
         let mut c = CommandBuilder::new(&shell);
         c.arg("-l");
-        c.arg("-i");
         if let Some(cwd) = cwd {
             c.cwd(cwd);
         }

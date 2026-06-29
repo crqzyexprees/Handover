@@ -3,10 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use portable_pty::MasterPty;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 
 pub const DEFAULT_MEM_LIMIT: &str = "2g";
 pub const SANDBOX_MODES: &[&str] = &["docker", "native"];
@@ -17,16 +18,31 @@ pub const GOVERNOR_INTERVAL_SECS: u64 = 15;
 pub const RAM_SUSPEND_THRESHOLD: f32 = 85.0;
 pub const RAM_EMERGENCY_THRESHOLD: f32 = 95.0;
 
+/// Long-lived PTY for an instance (survives WebSocket reconnects).
+pub struct SharedPty {
+    pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub output_tx: broadcast::Sender<Vec<u8>>,
+    pub shutdown_tx: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
+    pub master: Arc<std::sync::Mutex<Box<dyn MasterPty + Send>>>,
+}
+
+pub struct WsAttachment {
+    pub attach_id: u64,
+    pub detach_tx: oneshot::Sender<()>,
+}
+
 #[derive(Clone)]
 pub struct PtySession {
     pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    pub close_tx: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 pub struct AppState {
     pub projects: RwLock<HashMap<String, Value>>,
     pub project_configs: RwLock<HashMap<String, Value>>,
     pub instances: RwLock<HashMap<String, Value>>,
+    pub pty_cores: RwLock<HashMap<String, Arc<SharedPty>>>,
+    pub pty_create_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    pub ws_attachments: RwLock<HashMap<String, WsAttachment>>,
     pub pty_sessions: RwLock<HashMap<String, PtySession>>,
     pub focused_project_id: RwLock<Option<String>>,
     pub project_last_active: RwLock<HashMap<String, f64>>,
@@ -51,6 +67,9 @@ impl AppState {
             projects: RwLock::new(HashMap::new()),
             project_configs: RwLock::new(HashMap::new()),
             instances: RwLock::new(HashMap::new()),
+            pty_cores: RwLock::new(HashMap::new()),
+            pty_create_locks: Mutex::new(HashMap::new()),
+            ws_attachments: RwLock::new(HashMap::new()),
             pty_sessions: RwLock::new(HashMap::new()),
             focused_project_id: RwLock::new(None),
             project_last_active: RwLock::new(HashMap::new()),

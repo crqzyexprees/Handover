@@ -1,6 +1,6 @@
 [package]
 name = "handover-desktop"
-version = "1.0.5"
+version = "1.0.6"
 description = "Handover desktop shell"
 authors = ["Handover"]
 edition = "2021"

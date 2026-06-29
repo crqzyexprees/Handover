@@ -1,7 +1,7 @@
 {
   "name": "handover",
   "private": true,
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Multi-terminal AI CLI orchestration with Docker sandboxes and project handoffs.",
   "author": "Handover",
   "type": "module",

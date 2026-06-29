@@ -113,14 +113,6 @@ async fn get_docker(ctx: &ServerCtx) -> Result<Arc<DockerRuntime>, Response> {
     Ok(runtime)
 }
 
-fn close_pty_session(session: &crate::state::PtySession) {
-    if let Ok(mut close_tx) = session.close_tx.lock() {
-        if let Some(close_tx) = close_tx.take() {
-            let _ = close_tx.send(());
-        }
-    }
-}
-
 fn sandbox_ok(mode: &str) -> bool {
     SANDBOX_MODES.contains(&mode)
 }
@@ -508,9 +500,7 @@ async fn unload_project(
     let docker = ctx.docker.read().await.clone();
     for instance_id in instance_ids {
         let instance = ctx.state.instances.write().await.remove(&instance_id);
-        if let Some(session) = ctx.state.pty_sessions.write().await.remove(&instance_id) {
-            close_pty_session(&session);
-        }
+        crate::pty::shutdown_instance_pty(&ctx.state, &instance_id).await;
         if let Some(inst) = instance {
             if let Some(cid) = inst.get("container_id").and_then(|v| v.as_str()) {
                 if let Some(d) = docker.as_ref() {
@@ -593,9 +583,7 @@ async fn delete_instance(
     if instance.is_none() {
         return Json(json!({ "status": "ok" }));
     }
-    if let Some(session) = ctx.state.pty_sessions.write().await.remove(&instance_id) {
-        close_pty_session(&session);
-    }
+    crate::pty::shutdown_instance_pty(&ctx.state, &instance_id).await;
     if let Some(inst) = instance {
         if let Some(cid) = inst.get("container_id").and_then(|v| v.as_str()) {
             if let Some(docker) = ctx.docker.read().await.clone() {

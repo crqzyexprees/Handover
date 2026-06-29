@@ -1,14 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
-import { WebglAddon } from '@xterm/addon-webgl'
 import '@xterm/xterm/css/xterm.css'
 import { getBackendWsUrl } from './platform.js'
 import { getInstanceStats } from './api'
 
 const STATS_POLL_MS = 5000
 const CONTROL_PREFIX = '__handover_control__:'
-const RECONNECT_MS = 1500
 
 const STATUS_LABEL = {
   connecting: 'Connecting…',
@@ -25,9 +23,15 @@ const STATUS_COLOR = {
 export default function TerminalView({ instanceId, isActive, onConnectionChange }) {
   const containerRef = useRef(null)
   const termRef = useRef(null)
+  const fitAddonRef = useRef(null)
+  const wsRef = useRef(null)
+  const dataSubRef = useRef(null)
+  const resizeSubRef = useRef(null)
+  const isActiveRef = useRef(isActive)
   const onConnectionChangeRef = useRef(onConnectionChange)
   const [statsState, setStatsState] = useState(null)
-  const [connectionStatus, setConnectionStatus] = useState('connecting')
+  const [connectionStatus, setConnectionStatus] = useState('disconnected')
+  const [reconnectNonce, setReconnectNonce] = useState(0)
 
   useEffect(() => {
     onConnectionChangeRef.current = onConnectionChange
@@ -39,6 +43,11 @@ export default function TerminalView({ instanceId, isActive, onConnectionChange 
   }, [instanceId])
 
   useEffect(() => {
+    isActiveRef.current = isActive
+  }, [isActive])
+
+  // xterm lifecycle — one terminal per instanceId
+  useEffect(() => {
     if (instanceId == null || instanceId === '') {
       return
     }
@@ -48,9 +57,7 @@ export default function TerminalView({ instanceId, isActive, onConnectionChange 
       return
     }
 
-    let disposed = false
-    let reconnectTimer = null
-    let ws = null
+    container.replaceChildren()
 
     const term = new Terminal({
       cursorBlink: true,
@@ -67,17 +74,75 @@ export default function TerminalView({ instanceId, isActive, onConnectionChange 
     term.loadAddon(fitAddon)
     term.open(container)
     termRef.current = term
+    fitAddonRef.current = fitAddon
 
-    let webglAddon = null
-    try {
-      webglAddon = new WebglAddon()
-      webglAddon.onContextLoss(() => {
-        webglAddon?.dispose()
-        webglAddon = null
-      })
-      term.loadAddon(webglAddon)
-    } catch {
-      webglAddon = null
+    const resizeObserver = new ResizeObserver(() => {
+      if (!isActiveRef.current) return
+      try {
+        fitAddon.fit()
+      } catch {
+        // Hidden tabs can report zero size
+      }
+    })
+    resizeObserver.observe(container)
+
+    return () => {
+      resizeObserver.disconnect()
+      dataSubRef.current?.dispose()
+      resizeSubRef.current?.dispose()
+      dataSubRef.current = null
+      resizeSubRef.current = null
+      if (wsRef.current) {
+        wsRef.current.onopen = null
+        wsRef.current.onmessage = null
+        wsRef.current.onerror = null
+        wsRef.current.onclose = null
+        if (
+          wsRef.current.readyState === WebSocket.OPEN ||
+          wsRef.current.readyState === WebSocket.CONNECTING
+        ) {
+          wsRef.current.close()
+        }
+        wsRef.current = null
+      }
+      fitAddonRef.current = null
+      termRef.current = null
+      term.dispose()
+    }
+  }, [instanceId])
+
+  // WebSocket — only while this tab is active (prevents stacked handlers)
+  useEffect(() => {
+    if (instanceId == null || instanceId === '' || !isActive) {
+      return
+    }
+
+    const term = termRef.current
+    const fitAddon = fitAddonRef.current
+    if (!term || !fitAddon) {
+      return
+    }
+
+    let disposed = false
+    let ws = null
+    let socketGeneration = 0
+
+    dataSubRef.current?.dispose()
+    resizeSubRef.current?.dispose()
+    dataSubRef.current = null
+    resizeSubRef.current = null
+    if (wsRef.current) {
+      wsRef.current.onopen = null
+      wsRef.current.onmessage = null
+      wsRef.current.onerror = null
+      wsRef.current.onclose = null
+      if (
+        wsRef.current.readyState === WebSocket.OPEN ||
+        wsRef.current.readyState === WebSocket.CONNECTING
+      ) {
+        wsRef.current.close()
+      }
+      wsRef.current = null
     }
 
     const sendResize = () => {
@@ -101,59 +166,61 @@ export default function TerminalView({ instanceId, isActive, onConnectionChange 
       }
     }
 
-    const scheduleReconnect = () => {
-      if (disposed) return
-      reconnectTimer = window.setTimeout(() => {
-        reconnectTimer = null
-        connect()
-      }, RECONNECT_MS)
+    const closeSocket = () => {
+      if (!ws) return
+      const closingWs = ws
+      ws.onopen = null
+      ws.onmessage = null
+      ws.onerror = null
+      ws.onclose = null
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close()
+      }
+      ws = null
+      if (wsRef.current === closingWs) {
+        wsRef.current = null
+      }
     }
 
     const connect = () => {
       if (disposed) return
 
-      if (ws) {
-        ws.onopen = null
-        ws.onmessage = null
-        ws.onerror = null
-        ws.onclose = null
-        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-          ws.close()
-        }
-        ws = null
-      }
+      closeSocket()
+      socketGeneration += 1
+      const myGeneration = socketGeneration
 
       reportConnection('connecting')
 
       const wsUrl = getBackendWsUrl(`/ws/pty/${encodeURIComponent(instanceId)}`)
-      ws = new WebSocket(wsUrl)
-      ws.binaryType = 'arraybuffer'
+      const nextWs = new WebSocket(wsUrl)
+      nextWs.binaryType = 'arraybuffer'
+      ws = nextWs
+      wsRef.current = nextWs
 
-      ws.onopen = () => {
-        if (disposed) return
+      nextWs.onopen = () => {
+        if (disposed || myGeneration !== socketGeneration) return
         reportConnection('connected')
         safeFit()
         sendResize()
       }
 
-      ws.onmessage = (event) => {
-        if (disposed) return
+      nextWs.onmessage = (event) => {
+        if (disposed || myGeneration !== socketGeneration) return
         if (typeof event.data === 'string') {
           term.write(event.data)
         } else if (event.data instanceof ArrayBuffer) {
-          term.write(new TextDecoder().decode(event.data))
+          term.write(new Uint8Array(event.data))
         }
       }
 
-      ws.onerror = () => {
-        if (disposed) return
+      nextWs.onerror = () => {
+        if (disposed || myGeneration !== socketGeneration) return
         reportConnection('disconnected')
       }
 
-      ws.onclose = () => {
-        if (disposed) return
+      nextWs.onclose = () => {
+        if (disposed || myGeneration !== socketGeneration) return
         reportConnection('disconnected')
-        scheduleReconnect()
       }
     }
 
@@ -161,53 +228,37 @@ export default function TerminalView({ instanceId, isActive, onConnectionChange 
       if (disposed || !ws || ws.readyState !== WebSocket.OPEN) return
       ws.send(data)
     })
+    dataSubRef.current = dataSub
 
     const resizeSub = term.onResize(() => {
       sendResize()
     })
-
-    const resizeObserver = new ResizeObserver(() => {
-      safeFit()
-    })
-    resizeObserver.observe(container)
+    resizeSubRef.current = resizeSub
 
     connect()
 
     return () => {
       disposed = true
-      if (reconnectTimer != null) {
-        window.clearTimeout(reconnectTimer)
-      }
-      resizeObserver.disconnect()
+      socketGeneration += 1
       dataSub.dispose()
       resizeSub.dispose()
-      if (webglAddon) {
-        try {
-          webglAddon.dispose()
-        } catch {
-          // Already disposed after context loss
-        }
+      if (dataSubRef.current === dataSub) {
+        dataSubRef.current = null
       }
-      if (ws) {
-        ws.onopen = null
-        ws.onmessage = null
-        ws.onerror = null
-        ws.onclose = null
-        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-          ws.close()
-        }
+      if (resizeSubRef.current === resizeSub) {
+        resizeSubRef.current = null
       }
-      termRef.current = null
-      term.dispose()
+      closeSocket()
       reportConnection('disconnected')
     }
-  }, [instanceId, reportConnection])
+  }, [instanceId, isActive, reconnectNonce, reportConnection])
 
   useEffect(() => {
     if (!isActive) return
     const timer = window.setTimeout(() => {
       try {
         termRef.current?.focus()
+        fitAddonRef.current?.fit()
       } catch {
         // Terminal may not be ready yet
       }
@@ -273,6 +324,17 @@ export default function TerminalView({ instanceId, isActive, onConnectionChange 
                   {stats.cpu_percent}% CPU
                 </span>
               )}
+              {connectionStatus === 'disconnected' && isActive ? (
+                <button
+                  type="button"
+                  onClick={() => setReconnectNonce((value) => value + 1)}
+                  className="pointer-events-auto cursor-pointer border-0 bg-transparent p-0 text-[#808080] hover:text-[#cccccc]"
+                  title="Reconnect terminal"
+                  aria-label="Reconnect terminal"
+                >
+                  ↻
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={() => termRef.current?.clear()}
