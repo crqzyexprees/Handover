@@ -4,11 +4,28 @@ Multi-terminal AI CLI orchestration with Docker sandboxes and project handoffs.
 
 **Current release:** v1.0.6
 
+> **Version policy:** Do not change version numbers in `package.json`, `Cargo.toml`, `tauri.conf.json`, or here unless explicitly requested. See [`VERSION_POLICY.md`](VERSION_POLICY.md).
+
 | Directory | Role |
 |-----------|------|
 | [`handover_app/`](handover_app/) | Tauri 2 + React desktop app |
 | [`handover_rust/`](handover_rust/) | Rust backend (`handover-backend`: REST API, WebSocket PTY, Docker) |
 | [`handover/docker/`](handover/docker/) | Docker sandbox base image (`handover-base:latest`) |
+
+## Terminal (troubleshooting)
+
+The embedded terminal uses the same protocol as the original Python backend:
+
+`xterm onData → WebSocket text → PTY → WebSocket text → xterm write`
+
+If typing fails after code changes, do a **full restart** (not hot reload):
+
+```bash
+pkill -f handover-backend; pkill -f tauri
+cd handover_app && bash scripts/prepare-backend-sidecar.sh debug && npm run dev:tauri
+```
+
+Open a **new** terminal tab after restarting. The old Python backend (`handover_python/`) was removed in the Tauri migration; this Rust backend replaces it with the same wire format.
 
 ## Architecture
 

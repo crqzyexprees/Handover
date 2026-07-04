@@ -162,13 +162,17 @@ export default function App() {
   }, [projects, focusedProjectId])
 
   const allInstances = useMemo(() => {
-    return projects.flatMap((project) =>
-      getProjectInstances(project)
-        .map((instance) => ({
-          instance_id: String(getInstanceId(instance) ?? ''),
-        }))
-        .filter((instance) => instance.instance_id !== ''),
-    )
+    const seen = new Set()
+    const instances = []
+    for (const project of projects) {
+      for (const instance of getProjectInstances(project)) {
+        const instanceId = String(getInstanceId(instance) ?? '')
+        if (instanceId === '' || seen.has(instanceId)) continue
+        seen.add(instanceId)
+        instances.push({ instance_id: instanceId })
+      }
+    }
+    return instances
   }, [projects])
 
   const startInstanceForProject = useCallback(async (
@@ -235,6 +239,9 @@ export default function App() {
           return project
         }
         const existing = Array.isArray(project.instances) ? project.instances : []
+        if (existing.some((instance) => String(getInstanceId(instance) ?? '') === normalizedId)) {
+          return project
+        }
         return {
           ...project,
           instances: [...existing, newInstance],
@@ -597,19 +604,21 @@ export default function App() {
             </div>
           </div>
         <div className="flex min-h-0 min-w-0 flex-1">
-          {allInstances.map((instance) => (
+          {focusedInstanceId != null && focusedInstanceId !== '' ? (
             <TerminalView
-              key={instance.instance_id}
-              instanceId={instance.instance_id}
-              isActive={instance.instance_id === String(focusedInstanceId ?? '')}
+              key={focusedInstanceId}
+              instanceId={focusedInstanceId}
               onConnectionChange={handlePtyConnectionChange}
             />
-          ))}
-          {allInstances.length === 0 ? (
+          ) : allInstances.length === 0 ? (
             <div className="box-border flex min-h-0 min-w-0 flex-1 items-center justify-center bg-[#1e1e1e] px-4 text-center text-sm text-[#808080]">
               Create a project and open a terminal to get started
             </div>
-          ) : null}
+          ) : (
+            <div className="box-border flex min-h-0 min-w-0 flex-1 items-center justify-center bg-[#1e1e1e] px-4 text-center text-sm text-[#808080]">
+              Select a terminal tab to continue
+            </div>
+          )}
         </div>
         </div>
       </div>
