@@ -2,6 +2,7 @@ mod docker;
 mod governor;
 mod handoff;
 mod local_config;
+mod platform;
 mod pty;
 mod state;
 
@@ -89,7 +90,7 @@ fn validate_project_path(path: &str) -> Result<String, Response> {
 
     canonical
         .to_str()
-        .map(String::from)
+        .map(|p| crate::platform::normalize_storage_path(p))
         .ok_or_else(|| api_err(StatusCode::BAD_REQUEST, "Project path is not valid UTF-8"))
 }
 
@@ -101,6 +102,26 @@ async fn get_docker(ctx: &ServerCtx) -> Result<Arc<DockerRuntime>, Response> {
     let mut slot = ctx.docker.write().await;
     if let Some(runtime) = slot.clone() {
         return Ok(runtime);
+    }
+
+    // If Docker isn't reachable yet, try to start it (e.g. launch Docker Desktop
+    // on Windows/macOS) and wait for the engine to come up before connecting.
+    if !tokio::task::spawn_blocking(crate::platform::docker_running)
+        .await
+        .unwrap_or(false)
+    {
+        tracing::info!("[docker] engine not reachable; attempting to start it");
+        let started = tokio::task::spawn_blocking(crate::platform::ensure_docker_running)
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("join error: {e}")))
+            .unwrap_or(false);
+        if !started {
+            return Err(api_err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Docker is not running and could not be started automatically. \
+                 Please start Docker Desktop and try again.",
+            ));
+        }
     }
 
     let runtime = Arc::new(DockerRuntime::new().map_err(|e| {

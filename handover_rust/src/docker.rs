@@ -13,6 +13,8 @@ use futures::StreamExt;
 use serde_json::json;
 use tempfile::TempDir;
 
+use crate::platform::{current_gid, current_uid, current_username, home_dir};
+
 pub const INSTANCE_LABEL: &str = "handover.instance_id";
 pub const BASE_IMAGE: &str = "handover-base:latest";
 pub const SANDBOX_HOME: &str = "/home/sandbox";
@@ -71,8 +73,8 @@ impl DockerRuntime {
         mem_limit: &str,
         custom_env_vars: Option<&HashMap<String, String>>,
     ) -> Result<String> {
-        let uid = users::get_current_uid();
-        let gid = users::get_current_gid();
+        let uid = current_uid();
+        let gid = current_gid();
         let mem_bytes = parse_mem_bytes(mem_limit);
         let nss_path = self._nss_dir.path();
 
@@ -89,30 +91,32 @@ impl DockerRuntime {
         }
 
         let mut binds = vec![
-            format!("{project_path}:/workspace:rw,z"),
-            format!("{}/passwd:/etc/passwd:ro,z", nss_path.display()),
-            format!("{}/group:/etc/group:ro,z", nss_path.display()),
+            crate::platform::docker_bind_rw(project_path, "/workspace"),
+            crate::platform::docker_bind_ro(
+                &nss_path.join("passwd").to_string_lossy(),
+                "/etc/passwd",
+            ),
+            crate::platform::docker_bind_ro(
+                &nss_path.join("group").to_string_lossy(),
+                "/etc/group",
+            ),
         ];
 
         for (host, rel) in CONFIG_MOUNTS {
             let expanded = expand_home(host);
             if expanded.is_dir() {
-                binds.push(format!(
-                    "{}:{}/{}:ro,z",
-                    expanded.display(),
-                    CONFIG_STAGING_DIR,
-                    rel
+                binds.push(crate::platform::docker_bind_ro(
+                    &expanded.to_string_lossy(),
+                    &format!("{CONFIG_STAGING_DIR}/{rel}"),
                 ));
             }
         }
         for (host, rel) in CONFIG_FILE_MOUNTS {
             let expanded = expand_home(host);
             if expanded.is_file() {
-                binds.push(format!(
-                    "{}:{}/{}:ro,z",
-                    expanded.display(),
-                    CONFIG_STAGING_DIR,
-                    rel
+                binds.push(crate::platform::docker_bind_ro(
+                    &expanded.to_string_lossy(),
+                    &format!("{CONFIG_STAGING_DIR}/{rel}"),
                 ));
             }
         }
@@ -304,8 +308,8 @@ impl DockerRuntime {
 
 fn expand_home(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
+        if let Some(home) = home_dir() {
+            return home.join(rest);
         }
     }
     PathBuf::from(path)
@@ -327,11 +331,9 @@ fn build_nss_files() -> Result<TempDir> {
         .prefix(NSS_DIR_PREFIX)
         .tempdir()
         .context("tempdir failed")?;
-    let uid = users::get_current_uid();
-    let gid = users::get_current_gid();
-    let user = users::get_current_username()
-        .map(|u| u.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "sandbox".into());
+    let uid = current_uid();
+    let gid = current_gid();
+    let user = current_username();
 
     let passwd = format!(
         "root:x:0:0:root:/root:/bin/bash\n{user}:x:{uid}:{gid}:{user}:{SANDBOX_HOME}:/bin/bash\n"
