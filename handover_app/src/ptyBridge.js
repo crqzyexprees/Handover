@@ -16,8 +16,6 @@ function getBridgeState() {
       term: null,
       socketGeneration: 0,
       inputGeneration: 0,
-      lastSendKey: '',
-      lastSendAt: 0,
     }
   }
   return globalThis[BRIDGE_KEY]
@@ -143,16 +141,7 @@ export function connectPtyBridge({ instanceId, term, fitAddon, report }) {
   state.dataSub = term.onData((data) => {
     if (state.inputGeneration !== inputGeneration) return
     if (!shouldForwardInput(data)) return
-
-    const now = performance.now()
-    if (data.length === 1 && data === state.lastSendKey && now - state.lastSendAt < 32) {
-      return
-    }
-
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return
-
-    state.lastSendKey = data.length === 1 ? data : ''
-    state.lastSendAt = now
     state.ws.send(data)
   })
 
