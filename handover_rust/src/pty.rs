@@ -67,14 +67,9 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
             None
         };
         let cwd = project_path
-            .map(PathBuf::from)
+            .map(|p| PathBuf::from(crate::platform::normalize_storage_path(&p)))
             .filter(|p| p.is_dir())
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(PathBuf::from)
-                    .filter(|p| p.is_dir())
-            });
+            .or_else(|| crate::platform::home_dir());
         (mode, cid, cwd)
     };
 
@@ -266,10 +261,12 @@ fn spawn_pty_child(
     })?;
 
     let cmd = if sandbox_mode == "native" {
-        // Same flags the Python pexpect backend used
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+        // Cross-platform shell selection: bash/zsh on Unix, PowerShell/cmd on Windows.
+        let (shell, args) = crate::platform::native_shell();
         let mut c = CommandBuilder::new(&shell);
-        c.args(["-l", "-i"]);
+        for arg in &args {
+            c.arg(arg);
+        }
         if let Some(cwd) = cwd {
             c.cwd(cwd);
         }
@@ -277,8 +274,23 @@ fn spawn_pty_child(
         c
     } else {
         let cid = container_id.context("missing container_id")?;
-        let mut c = CommandBuilder::new("docker");
-        c.args(["exec", "-it", cid, "/bin/bash"]);
+        // Use -i only (not -t): portable-pty already provides the terminal.
+        // Nesting docker's -t inside a ConPTY on Windows causes immediate disconnect.
+        // `script` allocates a PTY inside the container so bash doesn't warn about
+        // job control / ioctl when attached through docker exec -i on Windows.
+        let mut c = CommandBuilder::new(crate::platform::docker_cli());
+        c.args([
+            "exec",
+            "-i",
+            "--workdir",
+            "/workspace",
+            cid,
+            "script",
+            "-qf",
+            "/dev/null",
+            "-c",
+            "bash -li",
+        ]);
         c.env("TERM", "xterm-256color");
         c
     };

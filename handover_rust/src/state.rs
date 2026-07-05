@@ -119,8 +119,8 @@ fn state_path() -> PathBuf {
     if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
         return PathBuf::from(data_home).join("handover/state.json");
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".local/share/handover/state.json");
+    if let Some(home) = crate::platform::home_dir() {
+        return home.join(".local/share/handover/state.json");
     }
     PathBuf::from(".handover/state.json")
 }

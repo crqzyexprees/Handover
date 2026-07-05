@@ -25,8 +25,9 @@ export default function TitleBar() {
     <header className="flex h-6 shrink-0 select-none items-stretch border-b border-[#333333] bg-[#252526] text-[#cccccc]">
       <div
         data-tauri-drag-region
-        className="flex min-w-0 flex-1 items-center justify-center px-2 text-[11px] font-medium tracking-wide"
+        className="flex min-w-0 flex-1 items-center justify-center gap-1.5 px-2 text-[11px] font-medium tracking-wide"
       >
+        <img src="/app-icon.png" alt="" className="size-3.5 shrink-0 rounded-sm" aria-hidden />
         Handover
       </div>
       <div className="flex h-full shrink-0 items-stretch">
