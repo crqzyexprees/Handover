@@ -1,6 +1,6 @@
 [package]
 name = "handover-desktop"
-version = "1.0.6"
+version = "1.0.7"
 description = "Handover desktop shell"
 authors = ["Handover"]
 edition = "2021"
@@ -19,3 +19,4 @@ serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
+tauri-plugin-clipboard-manager = "2"

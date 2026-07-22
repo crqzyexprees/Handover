@@ -10,6 +10,7 @@
     "core:window:allow-start-dragging",
     "dialog:default",
     "shell:default",
+    "clipboard-manager:default",
     "allow-get-backend-port"
   ]
 }

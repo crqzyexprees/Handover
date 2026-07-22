@@ -2,42 +2,22 @@
  * Linux-style terminal keyboard shortcuts for xterm.
  * Ctrl+Shift+C/V, Ctrl+Insert, Shift+Insert, select-all, font zoom.
  */
+import { readClipboard, writeClipboard } from './clipboard.js'
 import { pasteIntoTerminal } from './ptyBridge.js'
 
 const DEFAULT_FONT_SIZE = 14
 const MIN_FONT_SIZE = 8
 const MAX_FONT_SIZE = 32
 
-async function readClipboardText() {
-  if (navigator.clipboard?.readText) {
-    return navigator.clipboard.readText()
-  }
-  return ''
-}
-
-async function writeClipboardText(text) {
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text)
-    return
-  }
-  const textarea = document.createElement('textarea')
-  textarea.value = text
-  textarea.style.position = 'fixed'
-  textarea.style.left = '-9999px'
-  document.body.appendChild(textarea)
-  textarea.select()
-  document.execCommand('copy')
-  document.body.removeChild(textarea)
-}
-
 async function copySelection(term) {
+  if (!term.hasSelection()) return false
   const selection = term.getSelection()
-  if (!selection) return
-  await writeClipboardText(selection)
+  if (!selection) return false
+  return writeClipboard(selection)
 }
 
 async function pasteFromClipboard(term) {
-  const text = await readClipboardText()
+  const text = await readClipboard()
   if (!text) return
   pasteIntoTerminal(text)
   term.focus()
@@ -68,72 +48,80 @@ export function attachTerminalShortcuts(term, container) {
 
     const ctrl = event.ctrlKey || event.metaKey
     const shift = event.shiftKey
+    const key = event.key
 
     // Ctrl+Shift+C — copy (Linux terminal default)
-    if (ctrl && shift && (event.key === 'c' || event.key === 'C')) {
+    if (ctrl && shift && (key === 'c' || key === 'C')) {
+      event.preventDefault()
+      void copySelection(term)
+      return false
+    }
+
+    // Ctrl+C with selection — copy instead of sending SIGINT
+    if (ctrl && !shift && (key === 'c' || key === 'C') && term.hasSelection()) {
       event.preventDefault()
       void copySelection(term)
       return false
     }
 
     // Ctrl+Shift+V — paste
-    if (ctrl && shift && (event.key === 'v' || event.key === 'V')) {
+    if (ctrl && shift && (key === 'v' || key === 'V')) {
       event.preventDefault()
       void pasteFromClipboard(term)
       return false
     }
 
     // Ctrl+Shift+A — select all
-    if (ctrl && shift && (event.key === 'a' || event.key === 'A')) {
+    if (ctrl && shift && (key === 'a' || key === 'A')) {
       event.preventDefault()
       term.selectAll()
       return false
     }
 
     // Ctrl+Insert — copy
-    if (ctrl && !shift && event.key === 'Insert') {
+    if (ctrl && !shift && key === 'Insert') {
       event.preventDefault()
       void copySelection(term)
       return false
     }
 
     // Shift+Insert — paste
-    if (!ctrl && shift && event.key === 'Insert') {
+    if (!ctrl && shift && key === 'Insert') {
       event.preventDefault()
       void pasteFromClipboard(term)
       return false
     }
 
     // Ctrl+Shift+Plus / Ctrl+Shift+= — increase font
-    if (ctrl && shift && (event.key === '+' || event.key === '=')) {
+    if (ctrl && shift && (key === '+' || key === '=')) {
       event.preventDefault()
       handleZoom(term, 1)
       return false
     }
 
     // Ctrl+Shift+Minus — decrease font
-    if (ctrl && shift && event.key === '-') {
+    if (ctrl && shift && key === '-') {
       event.preventDefault()
       handleZoom(term, -1)
       return false
     }
 
     // Ctrl+Shift+0 — reset font
-    if (ctrl && shift && event.key === '0') {
+    if (ctrl && shift && key === '0') {
       event.preventDefault()
       term.options.fontSize = DEFAULT_FONT_SIZE
       return false
     }
 
     // Ctrl+Shift+Home — scroll to top
-    if (ctrl && shift && event.key === 'Home') {
+    if (ctrl && shift && key === 'Home') {
       event.preventDefault()
       term.scrollToTop()
       return false
     }
 
     // Ctrl+Shift+End — scroll to bottom
-    if (ctrl && shift && event.key === 'End') {
+    if (ctrl && shift && key === 'End') {
       event.preventDefault()
       term.scrollToBottom()
       return false
@@ -142,17 +130,34 @@ export function attachTerminalShortcuts(term, container) {
     return true
   })
 
-  // Middle-click paste (common on Linux)
   const onMouseDown = (event) => {
-    if (event.button !== 1) return
-    event.preventDefault()
-    void pasteFromClipboard(term)
+    // Middle-click paste (Linux)
+    if (event.button === 1) {
+      event.preventDefault()
+      void pasteFromClipboard(term)
+      return
+    }
+
+    // Right-click copy when text is selected
+    if (event.button === 2 && term.hasSelection()) {
+      event.preventDefault()
+      void copySelection(term)
+    }
+  }
+
+  const onContextMenu = (event) => {
+    if (term.hasSelection()) {
+      event.preventDefault()
+      void copySelection(term)
+    }
   }
 
   container.addEventListener('mousedown', onMouseDown)
+  container.addEventListener('contextmenu', onContextMenu)
 
   return () => {
     term.attachCustomKeyEventHandler(() => true)
     container.removeEventListener('mousedown', onMouseDown)
+    container.removeEventListener('contextmenu', onContextMenu)
   }
 }

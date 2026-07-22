@@ -65,6 +65,7 @@ pub fn run() {
     let result = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 if let Some(icon) = app.default_window_icon().cloned() {

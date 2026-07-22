@@ -2,7 +2,7 @@
 
 Multi-terminal AI CLI orchestration with Docker sandboxes and project handoffs.
 
-**Current release:** v1.0.6
+**Current release:** v1.0.7
 
 > **Version policy:** Do not change version numbers in `package.json`, `Cargo.toml`, `tauri.conf.json`, or here unless explicitly requested. See [`VERSION_POLICY.md`](VERSION_POLICY.md).
 
