@@ -108,7 +108,7 @@ Build release packages on the target OS:
   is currently a placeholder and should be replaced with a real macOS `.icns`
   before public distribution.
 - Windows: build on Windows with the Rust MSVC toolchain and Visual Studio
-  Build Tools installed.
+  Build Tools installed. See [`WINDOWS_BUILD.md`](WINDOWS_BUILD.md) for the full guide.
 
 Docker mode requires Docker Desktop on macOS and Windows.
 

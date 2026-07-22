@@ -58,6 +58,15 @@ export function disconnectPtyBridge() {
   state.term = null
 }
 
+/** Paste into the active PTY using bracketed paste (safe for shells). */
+export function pasteIntoTerminal(text) {
+  const state = getBridgeState()
+  if (typeof text !== 'string' || text.length === 0) return
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return
+  const sanitized = text.replace(/\x1b/g, '')
+  state.ws.send(`\x1b[200~${sanitized}\x1b[201~`)
+}
+
 export function connectPtyBridge({ instanceId, term, fitAddon, report }) {
   const state = getBridgeState()
   disconnectPtyBridge()

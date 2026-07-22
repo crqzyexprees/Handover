@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { getInstanceStats } from './api'
 import { connectPtyBridge } from './ptyBridge.js'
+import { attachTerminalShortcuts } from './terminalShortcuts.js'
 
 const STATS_POLL_MS = 5000
 
@@ -43,10 +44,12 @@ export default function TerminalView({ instanceId, onConnectionChange }) {
       cursorBlink: true,
       fontSize: 14,
       fontFamily: 'JetBrains Mono, Fira Code, monospace',
+      rightClickSelectsWord: true,
       theme: {
         background: '#0f1117',
         foreground: '#e2e8f0',
         cursor: '#60a5fa',
+        selectionBackground: '#264f78',
       },
     })
 
@@ -54,6 +57,8 @@ export default function TerminalView({ instanceId, onConnectionChange }) {
     term.loadAddon(fitAddon)
     term.open(container)
     termRef.current = term
+
+    const detachShortcuts = attachTerminalShortcuts(term, container)
 
     const resizeObserver = new ResizeObserver(() => {
       try {
@@ -88,6 +93,7 @@ export default function TerminalView({ instanceId, onConnectionChange }) {
     return () => {
       window.clearTimeout(focusTimer)
       resizeObserver.disconnect()
+      detachShortcuts()
       disconnectBridge()
       termRef.current = null
       term.dispose()
