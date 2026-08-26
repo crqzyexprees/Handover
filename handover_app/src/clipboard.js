@@ -45,15 +45,17 @@ export async function readClipboard() {
   if (import.meta.env.TAURI_ENV_PLATFORM) {
     try {
       const { readText } = await import('@tauri-apps/plugin-clipboard-manager')
-      return (await readText()) ?? ''
+      const text = await readText()
+      if (typeof text === 'string' && text.length > 0) return text
     } catch {
-      // fall through
+      // fall through to web APIs
     }
   }
 
   try {
     if (navigator.clipboard?.readText) {
-      return (await navigator.clipboard.readText()) ?? ''
+      const text = await navigator.clipboard.readText()
+      if (typeof text === 'string' && text.length > 0) return text
     }
   } catch {
     // fall through

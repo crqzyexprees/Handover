@@ -10,7 +10,8 @@
     "core:window:allow-start-dragging",
     "dialog:default",
     "shell:default",
-    "clipboard-manager:default",
+    "clipboard-manager:allow-read-text",
+    "clipboard-manager:allow-write-text",
     "allow-get-backend-port"
   ]
 }

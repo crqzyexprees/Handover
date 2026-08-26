@@ -21,13 +21,9 @@ function getBridgeState() {
   return globalThis[BRIDGE_KEY]
 }
 
-/** Drop ghost-handler bursts like "ba" / "bab"; allow keys, escapes, and bracketed paste. */
+/** Forward all non-empty input. Singleton bridge already prevents stacked handlers. */
 export function shouldForwardInput(data) {
-  if (typeof data !== 'string' || data.length === 0) return false
-  if (data.length === 1) return true
-  if (data.startsWith('\x1b')) return true
-  if (data.includes('\r') || data.includes('\n') || data.includes('\t')) return true
-  return false
+  return typeof data === 'string' && data.length > 0
 }
 
 function closeSocket(state) {
@@ -58,13 +54,23 @@ export function disconnectPtyBridge() {
   state.term = null
 }
 
-/** Paste into the active PTY using bracketed paste (safe for shells). */
-export function pasteIntoTerminal(text) {
+/**
+ * Paste into the active PTY.
+ * Uses bracketed paste so multi-line text is one block (bash/zsh won't
+ * execute each line). Falls back to CR-normalized raw send.
+ */
+export function pasteIntoTerminal(text, { bracketed = true } = {}) {
   const state = getBridgeState()
   if (typeof text !== 'string' || text.length === 0) return
   if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return
-  const sanitized = text.replace(/\x1b/g, '')
-  state.ws.send(`\x1b[200~${sanitized}\x1b[201~`)
+  // Strip ESC so pasted text cannot inject control sequences; map newlines to CR.
+  const sanitized = text
+    .replace(/\x1b/g, '')
+    .replace(/\r\n/g, '\r')
+    .replace(/\n/g, '\r')
+  if (!sanitized) return
+  const payload = bracketed ? `\x1b[200~${sanitized}\x1b[201~` : sanitized
+  state.ws.send(payload)
 }
 
 export function connectPtyBridge({ instanceId, term, fitAddon, report }) {

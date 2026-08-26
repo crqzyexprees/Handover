@@ -19,8 +19,18 @@ async function copySelection(term) {
 async function pasteFromClipboard(term) {
   const text = await readClipboard()
   if (!text) return
-  pasteIntoTerminal(text)
-  term.focus()
+  try {
+    // xterm.paste normalizes newlines and wraps with bracketed-paste
+    // markers when the shell has enabled that mode (safe multi-line).
+    term.paste(text)
+  } catch {
+    pasteIntoTerminal(text)
+  }
+  try {
+    term.focus()
+  } catch {
+    // ignore
+  }
 }
 
 function isModifierOnly(event) {
