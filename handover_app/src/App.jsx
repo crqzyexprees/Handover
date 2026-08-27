@@ -603,22 +603,30 @@ export default function App() {
         />
             </div>
           </div>
-        <div className="flex min-h-0 min-w-0 flex-1">
-          {focusedInstanceId != null && focusedInstanceId !== '' ? (
-            <TerminalView
-              key={focusedInstanceId}
-              instanceId={focusedInstanceId}
-              onConnectionChange={handlePtyConnectionChange}
-            />
-          ) : allInstances.length === 0 ? (
+        <div className="relative flex min-h-0 min-w-0 flex-1">
+          {allInstances.length === 0 ? (
             <div className="box-border flex min-h-0 min-w-0 flex-1 items-center justify-center bg-[#1e1e1e] px-4 text-center text-sm text-[#808080]">
               Create a project and open a terminal to get started
             </div>
-          ) : (
+          ) : focusedInstanceId == null || focusedInstanceId === '' ? (
             <div className="box-border flex min-h-0 min-w-0 flex-1 items-center justify-center bg-[#1e1e1e] px-4 text-center text-sm text-[#808080]">
               Select a terminal tab to continue
             </div>
-          )}
+          ) : null}
+          {/* Keep every instance mounted (native + docker) so tab switches
+              do not dispose xterm or close the PTY WebSocket. */}
+          {allInstances.map((instance) => {
+            const instanceId = String(instance.instance_id ?? '')
+            if (!instanceId) return null
+            return (
+              <TerminalView
+                key={instanceId}
+                instanceId={instanceId}
+                isActive={instanceId === String(focusedInstanceId ?? '')}
+                onConnectionChange={handlePtyConnectionChange}
+              />
+            )
+          })}
         </div>
         </div>
       </div>

@@ -1,27 +1,41 @@
 /**
- * Single WebSocket + onData attachment for the whole app.
+ * One WebSocket + onData attachment per terminal instance.
+ * Works for both native and docker sandbox modes (same /ws/pty/{id} path).
  * React/HMR must never register term.onData directly — only this module does.
  */
 import { getBackendWsUrl } from './platform.js'
 
 const CONTROL_PREFIX = '__handover_control__:'
-const BRIDGE_KEY = '__handover_pty_bridge__'
+const BRIDGES_KEY = '__handover_pty_bridges__'
 
-function getBridgeState() {
-  if (!globalThis[BRIDGE_KEY]) {
-    globalThis[BRIDGE_KEY] = {
-      dataSub: null,
-      resizeSub: null,
-      ws: null,
-      term: null,
-      socketGeneration: 0,
-      inputGeneration: 0,
-    }
+function getBridges() {
+  if (!globalThis[BRIDGES_KEY]) {
+    globalThis[BRIDGES_KEY] = new Map()
   }
-  return globalThis[BRIDGE_KEY]
+  return globalThis[BRIDGES_KEY]
 }
 
-/** Forward all non-empty input. Singleton bridge already prevents stacked handlers. */
+function createEmptyState() {
+  return {
+    dataSub: null,
+    resizeSub: null,
+    ws: null,
+    term: null,
+    socketGeneration: 0,
+    inputGeneration: 0,
+  }
+}
+
+function getBridgeState(instanceId) {
+  const key = String(instanceId ?? '')
+  const bridges = getBridges()
+  if (!bridges.has(key)) {
+    bridges.set(key, createEmptyState())
+  }
+  return bridges.get(key)
+}
+
+/** Forward all non-empty input. Per-instance bridge prevents stacked handlers. */
 export function shouldForwardInput(data) {
   return typeof data === 'string' && data.length > 0
 }
@@ -46,24 +60,35 @@ function detachInput(state) {
   state.inputGeneration += 1
 }
 
-export function disconnectPtyBridge() {
-  const state = getBridgeState()
+/** Disconnect one instance, or all if instanceId is omitted. */
+export function disconnectPtyBridge(instanceId) {
+  if (instanceId == null || instanceId === '') {
+    for (const key of [...getBridges().keys()]) {
+      disconnectPtyBridge(key)
+    }
+    return
+  }
+
+  const key = String(instanceId)
+  const state = getBridges().get(key)
+  if (!state) return
   state.socketGeneration += 1
   detachInput(state)
   closeSocket(state)
   state.term = null
+  getBridges().delete(key)
 }
 
 /**
- * Paste into the active PTY.
- * Uses bracketed paste so multi-line text is one block (bash/zsh won't
- * execute each line). Falls back to CR-normalized raw send.
+ * Paste into a specific instance PTY.
+ * Uses bracketed paste so multi-line text is one block.
  */
-export function pasteIntoTerminal(text, { bracketed = true } = {}) {
-  const state = getBridgeState()
+export function pasteIntoTerminal(text, instanceId, { bracketed = true } = {}) {
   if (typeof text !== 'string' || text.length === 0) return
-  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return
-  // Strip ESC so pasted text cannot inject control sequences; map newlines to CR.
+  const key = String(instanceId ?? '')
+  if (!key) return
+  const state = getBridges().get(key)
+  if (!state?.ws || state.ws.readyState !== WebSocket.OPEN) return
   const sanitized = text
     .replace(/\x1b/g, '')
     .replace(/\r\n/g, '\r')
@@ -74,9 +99,11 @@ export function pasteIntoTerminal(text, { bracketed = true } = {}) {
 }
 
 export function connectPtyBridge({ instanceId, term, fitAddon, report }) {
-  const state = getBridgeState()
-  disconnectPtyBridge()
+  const key = String(instanceId)
+  // Only tear down THIS instance's prior bridge — leave other tabs alone.
+  disconnectPtyBridge(key)
 
+  const state = getBridgeState(key)
   state.term = term
   state.socketGeneration += 1
   const socketGeneration = state.socketGeneration
@@ -92,6 +119,7 @@ export function connectPtyBridge({ instanceId, term, fitAddon, report }) {
     ) {
       return
     }
+    if (!term.cols || !term.rows) return
     state.ws.send(
       `${CONTROL_PREFIX}${JSON.stringify({
         type: 'resize',
@@ -109,7 +137,7 @@ export function connectPtyBridge({ instanceId, term, fitAddon, report }) {
     closeSocket(state)
     report('connecting')
 
-    const ws = new WebSocket(getBackendWsUrl(`/ws/pty/${encodeURIComponent(instanceId)}`))
+    const ws = new WebSocket(getBackendWsUrl(`/ws/pty/${encodeURIComponent(key)}`))
     ws.binaryType = 'arraybuffer'
     state.ws = ws
 
@@ -124,7 +152,6 @@ export function connectPtyBridge({ instanceId, term, fitAddon, report }) {
       } catch {
         // ignore
       }
-      term.focus()
     }
 
     ws.onmessage = (event) => {
@@ -168,7 +195,7 @@ export function connectPtyBridge({ instanceId, term, fitAddon, report }) {
 
   return () => {
     if (state.inputGeneration !== inputGeneration) return
-    disconnectPtyBridge()
+    disconnectPtyBridge(key)
     report('disconnected')
   }
 }

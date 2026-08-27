@@ -20,9 +20,15 @@ const STATUS_COLOR = {
   disconnected: 'text-red-400',
 }
 
-export default function TerminalView({ instanceId, onConnectionChange }) {
+/**
+ * One persistent terminal session per instanceId (native or docker).
+ * When inactive, stay mounted + connected — only hide visually so scrollback survives tab switches.
+ */
+export default function TerminalView({ instanceId, isActive = true, onConnectionChange }) {
   const containerRef = useRef(null)
   const termRef = useRef(null)
+  const fitAddonRef = useRef(null)
+  const isActiveRef = useRef(isActive)
   const onConnectionChangeRef = useRef(onConnectionChange)
   const [statsState, setStatsState] = useState(null)
   const [connectionStatus, setConnectionStatus] = useState('disconnected')
@@ -32,6 +38,11 @@ export default function TerminalView({ instanceId, onConnectionChange }) {
     onConnectionChangeRef.current = onConnectionChange
   }, [onConnectionChange])
 
+  useEffect(() => {
+    isActiveRef.current = isActive
+  }, [isActive])
+
+  // Create xterm + WS once per instanceId. Tab switches must NOT remount this.
   useEffect(() => {
     if (instanceId == null || instanceId === '') return
 
@@ -45,6 +56,7 @@ export default function TerminalView({ instanceId, onConnectionChange }) {
       fontSize: 14,
       fontFamily: 'JetBrains Mono, Fira Code, monospace',
       rightClickSelectsWord: true,
+      scrollback: 5000,
       theme: {
         background: '#0f1117',
         foreground: '#e2e8f0',
@@ -57,8 +69,9 @@ export default function TerminalView({ instanceId, onConnectionChange }) {
     term.loadAddon(fitAddon)
     term.open(container)
     termRef.current = term
+    fitAddonRef.current = fitAddon
 
-    const detachShortcuts = attachTerminalShortcuts(term, container)
+    const detachShortcuts = attachTerminalShortcuts(term, container, instanceId)
 
     const resizeObserver = new ResizeObserver(() => {
       try {
@@ -82,6 +95,7 @@ export default function TerminalView({ instanceId, onConnectionChange }) {
     })
 
     const focusTimer = window.setTimeout(() => {
+      if (!isActiveRef.current) return
       try {
         term.focus()
         fitAddon.fit()
@@ -96,12 +110,31 @@ export default function TerminalView({ instanceId, onConnectionChange }) {
       detachShortcuts()
       disconnectBridge()
       termRef.current = null
+      fitAddonRef.current = null
       term.dispose()
     }
   }, [instanceId, reconnectNonce])
 
+  // When tab becomes active: refit + focus (no reconnect / no PTY respawn).
   useEffect(() => {
-    if (instanceId == null || instanceId === '') return
+    if (!isActive) return
+    const timer = window.setTimeout(() => {
+      try {
+        fitAddonRef.current?.fit()
+        const term = termRef.current
+        if (term) {
+          term.refresh(0, Math.max(0, term.rows - 1))
+          term.focus()
+        }
+      } catch {
+        // layout may still be settling
+      }
+    }, 0)
+    return () => window.clearTimeout(timer)
+  }, [isActive, instanceId])
+
+  useEffect(() => {
+    if (instanceId == null || instanceId === '' || !isActive) return
 
     let cancelled = false
 
@@ -119,7 +152,7 @@ export default function TerminalView({ instanceId, onConnectionChange }) {
       cancelled = true
       clearInterval(intervalId)
     }
-  }, [instanceId])
+  }, [instanceId, isActive])
 
   const stats = statsState?.instanceId === instanceId ? statsState.data : null
 
@@ -128,51 +161,65 @@ export default function TerminalView({ instanceId, onConnectionChange }) {
     stats.mem_limit_mb > 0 &&
     stats.mem_used_mb / stats.mem_limit_mb > 0.8
 
+  // Keep inactive panes sized (absolute fill) instead of display:none so
+  // xterm's canvas stays valid; WS/PTY stay open for native and docker alike.
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+    <div
+      className={
+        isActive
+          ? 'relative z-10 flex min-h-0 min-w-0 flex-1 flex-col'
+          : 'pointer-events-none invisible absolute inset-0 z-0 flex min-h-0 min-w-0 flex-col'
+      }
+      aria-hidden={!isActive}
+    >
       <div className="box-border flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-[#1e1e1e]">
         <div
           className="relative min-h-0 min-w-0 flex-1"
-          onClick={() => termRef.current?.focus()}
+          onClick={() => {
+            if (!isActive) return
+            termRef.current?.focus()
+          }}
         >
           <div ref={containerRef} className="h-full min-h-0 min-w-0" />
-          <div className="pointer-events-none absolute right-2 bottom-2 z-10">
-            <div className="flex items-center gap-1.5 rounded bg-[#1e1e1e]/80 px-2 py-1 text-[10px]">
-              <span className={STATUS_COLOR[connectionStatus] ?? STATUS_COLOR.disconnected}>
-                ● {STATUS_LABEL[connectionStatus] ?? connectionStatus}
-              </span>
-              {stats != null && (
-                <span
-                  className={
-                    memOverLimit ? 'text-[#ef4444]' : 'text-[#808080]'
-                  }
-                >
-                  {stats.mem_used_mb}MB / {stats.mem_limit_mb}MB |{' '}
-                  {stats.cpu_percent}% CPU
+          {isActive ? (
+            <div className="pointer-events-none absolute right-2 bottom-2 z-10">
+              <div className="flex items-center gap-1.5 rounded bg-[#1e1e1e]/80 px-2 py-1 text-[10px]">
+                <span className={STATUS_COLOR[connectionStatus] ?? STATUS_COLOR.disconnected}>
+                  ● {STATUS_LABEL[connectionStatus] ?? connectionStatus}
                 </span>
-              )}
-              {connectionStatus === 'disconnected' ? (
+                {stats != null && (
+                  <span
+                    className={
+                      memOverLimit ? 'text-[#ef4444]' : 'text-[#808080]'
+                    }
+                  >
+                    {stats.mem_used_mb}MB / {stats.mem_limit_mb}MB |{' '}
+                    {stats.cpu_percent}% CPU
+                  </span>
+                )}
+                {connectionStatus === 'disconnected' ? (
+                  <button
+                    type="button"
+                    onClick={() => setReconnectNonce((n) => n + 1)}
+                    className="pointer-events-auto cursor-pointer border-0 bg-transparent p-0 text-[#808080] hover:text-[#cccccc]"
+                    title="Reconnect terminal"
+                    aria-label="Reconnect terminal"
+                  >
+                    ↻
+                  </button>
+                ) : null}
                 <button
                   type="button"
-                  onClick={() => setReconnectNonce((n) => n + 1)}
-                  className="pointer-events-auto cursor-pointer border-0 bg-transparent p-0 text-[#808080] hover:text-[#cccccc]"
-                  title="Reconnect terminal"
-                  aria-label="Reconnect terminal"
+                  onClick={() => termRef.current?.clear()}
+                  className="pointer-events-auto cursor-pointer border-0 bg-transparent p-0 text-[#808080] leading-none hover:text-[#a0a0a0]"
+                  title="Clear terminal"
+                  aria-label="Clear terminal"
                 >
-                  ↻
+                  🗑️
                 </button>
-              ) : null}
-              <button
-                type="button"
-                onClick={() => termRef.current?.clear()}
-                className="pointer-events-auto cursor-pointer border-0 bg-transparent p-0 text-[#808080] leading-none hover:text-[#a0a0a0]"
-                title="Clear terminal"
-                aria-label="Clear terminal"
-              >
-                🗑️
-              </button>
+              </div>
             </div>
-          </div>
+          ) : null}
         </div>
       </div>
     </div>

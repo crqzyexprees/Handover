@@ -16,15 +16,16 @@ async function copySelection(term) {
   return writeClipboard(selection)
 }
 
-async function pasteFromClipboard(term) {
+async function pasteFromClipboard(term, instanceId) {
   const text = await readClipboard()
   if (!text) return
   try {
     // xterm.paste normalizes newlines and wraps with bracketed-paste
     // markers when the shell has enabled that mode (safe multi-line).
+    // Goes through this term's onData → that instance's WebSocket.
     term.paste(text)
   } catch {
-    pasteIntoTerminal(text)
+    pasteIntoTerminal(text, instanceId)
   }
   try {
     term.focus()
@@ -48,9 +49,10 @@ function handleZoom(term, delta) {
 /**
  * @param {import('@xterm/xterm').Terminal} term
  * @param {HTMLElement} container
+ * @param {string} [instanceId]
  * @returns {() => void}
  */
-export function attachTerminalShortcuts(term, container) {
+export function attachTerminalShortcuts(term, container, instanceId) {
   term.attachCustomKeyEventHandler((event) => {
     if (event.type !== 'keydown' || isModifierOnly(event)) {
       return true
@@ -77,7 +79,7 @@ export function attachTerminalShortcuts(term, container) {
     // Ctrl+Shift+V — paste
     if (ctrl && shift && (key === 'v' || key === 'V')) {
       event.preventDefault()
-      void pasteFromClipboard(term)
+      void pasteFromClipboard(term, instanceId)
       return false
     }
 
@@ -98,7 +100,7 @@ export function attachTerminalShortcuts(term, container) {
     // Shift+Insert — paste
     if (!ctrl && shift && key === 'Insert') {
       event.preventDefault()
-      void pasteFromClipboard(term)
+      void pasteFromClipboard(term, instanceId)
       return false
     }
 
@@ -144,7 +146,7 @@ export function attachTerminalShortcuts(term, container) {
     // Middle-click paste (Linux)
     if (event.button === 1) {
       event.preventDefault()
-      void pasteFromClipboard(term)
+      void pasteFromClipboard(term, instanceId)
       return
     }
 
