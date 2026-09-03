@@ -20,23 +20,32 @@ sync_appdir_icons() {
   [[ -d "$APPDIR" ]] || return 0
   cp "$ICON_DIR/icon.png" "$APPDIR/Handover.png"
   cp "$ICON_DIR/icon.png" "$APPDIR/handover-desktop.png"
+  cp "$ICON_DIR/icon.png" "$APPDIR/com.crqzyexprees.handover.png"
   mkdir -p \
     "$APPDIR/usr/share/icons/hicolor/32x32/apps" \
     "$APPDIR/usr/share/icons/hicolor/128x128/apps" \
     "$APPDIR/usr/share/icons/hicolor/256x256@2/apps" \
     "$APPDIR/usr/share/icons/hicolor/512x512/apps"
-  cp "$ICON_DIR/32x32.png" "$APPDIR/usr/share/icons/hicolor/32x32/apps/handover-desktop.png"
-  cp "$ICON_DIR/128x128.png" "$APPDIR/usr/share/icons/hicolor/128x128/apps/handover-desktop.png"
-  cp "$ICON_DIR/128x128@2x.png" "$APPDIR/usr/share/icons/hicolor/256x256@2/apps/handover-desktop.png"
-  cp "$ICON_DIR/icon.png" "$APPDIR/usr/share/icons/hicolor/512x512/apps/handover-desktop.png"
+  for icon_name in handover-desktop com.crqzyexprees.handover; do
+    cp "$ICON_DIR/32x32.png" "$APPDIR/usr/share/icons/hicolor/32x32/apps/${icon_name}.png"
+    cp "$ICON_DIR/128x128.png" "$APPDIR/usr/share/icons/hicolor/128x128/apps/${icon_name}.png"
+    cp "$ICON_DIR/128x128@2x.png" "$APPDIR/usr/share/icons/hicolor/256x256@2/apps/${icon_name}.png"
+    cp "$ICON_DIR/icon.png" "$APPDIR/usr/share/icons/hicolor/512x512/apps/${icon_name}.png"
+  done
   ln -sf Handover.png "$APPDIR/.DirIcon"
 
-  # Patch desktop files so StartupWMClass matches Tauri 2's identifier
+  # Match Tauri 2 identifier so GNOME Alt-Tab / taskbar use the Handover icon
   for df in "$APPDIR/Handover.desktop" "$APPDIR/usr/share/applications/Handover.desktop"; do
     if [[ -f "$df" ]]; then
-      sed -i 's/^StartupWMClass=.*/StartupWMClass=com.crqzyexprees.handover/' "$df"
+      sed -i \
+        -e 's/^StartupWMClass=.*/StartupWMClass=com.crqzyexprees.handover/' \
+        -e 's/^Icon=.*/Icon=com.crqzyexprees.handover/' \
+        "$df"
     fi
   done
+  if [[ -f "$APPDIR/Handover.desktop" ]]; then
+    cp "$APPDIR/Handover.desktop" "$APPDIR/usr/share/applications/com.crqzyexprees.handover.desktop"
+  fi
 }
 
 npm run icons

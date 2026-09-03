@@ -2,7 +2,7 @@
 Name=Handover
 Comment=Multi-terminal AI CLI orchestration
 Exec=handover-desktop %U
-Icon=handover-desktop
+Icon=com.crqzyexprees.handover
 Terminal=false
 Type=Application
 Categories=Development;

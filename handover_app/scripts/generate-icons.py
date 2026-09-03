@@ -91,6 +91,10 @@ def generate_from_source() -> bool:
     (ROOT / "128x128@2x.png").write_bytes(icon_pngs[256])
     (ROOT / "icon.png").write_bytes(icon_pngs[512])
 
+    public_dir = ROOT.parent.parent / "public"
+    public_dir.mkdir(parents=True, exist_ok=True)
+    (public_dir / "favicon.png").write_bytes(icon_pngs[128])
+
     write_ico(
         ROOT / "icon.ico",
         [(16, icon_pngs[16]), (32, icon_pngs[32]), (256, icon_pngs[256])],
