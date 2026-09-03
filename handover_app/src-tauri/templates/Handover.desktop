@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Handover
+Comment=Multi-terminal AI CLI orchestration
+Exec=handover-desktop %U
+Icon=handover-desktop
+Terminal=false
+Type=Application
+Categories=Development;
+StartupWMClass=com.crqzyexprees.handover

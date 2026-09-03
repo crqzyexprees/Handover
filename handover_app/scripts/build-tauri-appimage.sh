@@ -30,6 +30,13 @@ sync_appdir_icons() {
   cp "$ICON_DIR/128x128@2x.png" "$APPDIR/usr/share/icons/hicolor/256x256@2/apps/handover-desktop.png"
   cp "$ICON_DIR/icon.png" "$APPDIR/usr/share/icons/hicolor/512x512/apps/handover-desktop.png"
   ln -sf Handover.png "$APPDIR/.DirIcon"
+
+  # Patch desktop files so StartupWMClass matches Tauri 2's identifier
+  for df in "$APPDIR/Handover.desktop" "$APPDIR/usr/share/applications/Handover.desktop"; do
+    if [[ -f "$df" ]]; then
+      sed -i 's/^StartupWMClass=.*/StartupWMClass=com.crqzyexprees.handover/' "$df"
+    fi
+  done
 }
 
 npm run icons
