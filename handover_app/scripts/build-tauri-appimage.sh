@@ -3,9 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TAURI_DIR="$ROOT_DIR/src-tauri"
-# Cursor/sandbox may set CARGO_TARGET_DIR to a cache outside the repo; always build in-tree.
+# Cursor/sandbox may set CARGO_TARGET_DIR to a cache outside the repo.
+# Backend sidecar lookup expects handover_rust/target; Tauri artifacts stay under src-tauri/target.
 unset CARGO_TARGET_DIR
-export CARGO_TARGET_DIR="$TAURI_DIR/target"
+BACKEND_TARGET_DIR="$(cd "$ROOT_DIR/.." && pwd)/handover_rust/target"
 export APPIMAGE_EXTRACT_AND_RUN=1
 APPDIR="$TAURI_DIR/target/release/bundle/appimage/Handover.AppDir"
 BUNDLE_DIR="$TAURI_DIR/target/release/bundle/appimage"
@@ -49,11 +50,12 @@ sync_appdir_icons() {
 }
 
 npm run icons
-npm run build:backend
+CARGO_TARGET_DIR="$BACKEND_TARGET_DIR" npm run build:backend
 node scripts/prepare-backend-sidecar.js release
 
 # Force re-link so embedded window icons match icon-source.png
-cargo build --release --manifest-path "$TAURI_DIR/Cargo.toml"
+CARGO_TARGET_DIR="$TAURI_DIR/target" cargo build --release --manifest-path "$TAURI_DIR/Cargo.toml"
+export CARGO_TARGET_DIR="$TAURI_DIR/target"
 
 set +e
 tauri build
