@@ -193,8 +193,10 @@ export default function TerminalView({ instanceId, isActive = true, onConnection
                       memOverLimit ? 'text-[#ef4444]' : 'text-[#808080]'
                     }
                   >
-                    {stats.mem_used_mb}MB / {stats.mem_limit_mb}MB |{' '}
-                    {stats.cpu_percent}% CPU
+                    {stats.mem_limit_mb > 0
+                      ? `${stats.mem_used_mb}MB / ${stats.mem_limit_mb}MB`
+                      : `${stats.mem_used_mb}MB`}{' '}
+                    | {stats.cpu_percent}% CPU
                   </span>
                 )}
                 {connectionStatus === 'disconnected' ? (

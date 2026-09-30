@@ -20,6 +20,8 @@ pub const RAM_EMERGENCY_THRESHOLD: f32 = 95.0;
 #[derive(Clone)]
 pub struct PtySession {
     pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Shell / docker-exec PID for native resource accounting.
+    pub shell_pid: Option<u32>,
 }
 
 pub struct AppState {

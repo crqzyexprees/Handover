@@ -2,6 +2,7 @@ mod docker;
 mod governor;
 mod handoff;
 mod local_config;
+mod process_stats;
 mod pty;
 mod state;
 
@@ -612,19 +613,31 @@ async fn instance_stats(
         .cloned()
         .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "Instance not found"))?;
 
-    let zeros = json!({
-        "mem_used_mb": 0.0,
-        "mem_limit_mb": 0.0,
-        "cpu_percent": 0.0,
-    });
+    if let Some(container_id) = instance
+        .get("container_id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+    {
+        let docker = get_docker(&ctx).await?;
+        return Ok(Json(docker.get_container_stats(container_id).await));
+    }
 
-    let container_id = match instance.get("container_id").and_then(|v| v.as_str()) {
-        Some(id) if !id.is_empty() => id,
-        _ => return Ok(Json(zeros)),
+    let shell_pid = ctx
+        .state
+        .pty_sessions
+        .read()
+        .await
+        .get(&instance_id)
+        .and_then(|s| s.shell_pid);
+    let stats = match shell_pid {
+        Some(pid) => {
+            tokio::task::spawn_blocking(move || process_stats::process_tree_stats(pid))
+                .await
+                .unwrap_or_else(|_| process_stats::zeros())
+        }
+        None => process_stats::zeros(),
     };
-
-    let docker = get_docker(&ctx).await?;
-    Ok(Json(docker.get_container_stats(container_id).await))
+    Ok(Json(stats))
 }
 
 async fn focus_instance(
@@ -970,25 +983,24 @@ async fn project_resources(
 
     let docker = get_docker(&ctx).await.ok();
     let mut instance_rows = Vec::new();
+    let mut native_pids: Vec<(usize, u32)> = Vec::new();
+
     for (index, (instance_id, inst)) in project_instances.iter().enumerate() {
-        let zeros = json!({
-            "mem_used_mb": 0.0,
-            "mem_limit_mb": 0.0,
-            "cpu_percent": 0.0,
-        });
-        let stats = if let Some(d) = docker.as_ref() {
-            if let Some(cid) = inst
-                .get("container_id")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-            {
-                d.get_container_stats(cid).await
-            } else {
-                zeros
-            }
+        let container_id = inst
+            .get("container_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let stats = if let (Some(d), Some(cid)) = (docker.as_ref(), container_id.as_deref()) {
+            d.get_container_stats(cid).await
+        } else if let Some(pid) = pty_sessions.get(instance_id).and_then(|s| s.shell_pid) {
+            native_pids.push((index, pid));
+            process_stats::zeros()
         } else {
-            zeros
+            process_stats::zeros()
         };
+
         instance_rows.push(json!({
             "instance_id": instance_id,
             "label": format!("Terminal {}", index + 1),
@@ -998,6 +1010,27 @@ async fn project_resources(
         }));
     }
     drop(pty_sessions);
+
+    if !native_pids.is_empty() {
+        let measured = tokio::task::spawn_blocking(move || {
+            let pids: Vec<u32> = native_pids.iter().map(|(_, pid)| *pid).collect();
+            let stats_by_pid = process_stats::process_tree_stats_batch(&pids);
+            native_pids
+                .into_iter()
+                .zip(stats_by_pid.into_iter().map(|(_, stats)| stats))
+                .map(|((index, _), stats)| (index, stats))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (index, stats) in measured {
+            if let Some(row) = instance_rows.get_mut(index) {
+                if let Some(obj) = row.as_object_mut() {
+                    obj.insert("stats".into(), stats);
+                }
+            }
+        }
+    }
 
     Ok(Json(json!({
         "system": {

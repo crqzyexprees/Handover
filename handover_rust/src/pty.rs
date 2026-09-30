@@ -131,6 +131,7 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         child,
     } = handles;
 
+    let shell_pid = child.process_id();
     let master = Arc::new(std::sync::Mutex::new(master));
     let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (read_tx, mut read_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -139,6 +140,7 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         instance_id.clone(),
         PtySession {
             input_tx: write_tx.clone(),
+            shell_pid,
         },
     );
 
