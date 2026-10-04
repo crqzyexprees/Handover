@@ -2,7 +2,7 @@
 
 Multi-terminal AI CLI orchestration with Docker sandboxes and project handoffs.
 
-**Current release:** v1.0.7
+**Current release:** v1.0.8
 
 > **Version policy:** Do not change version numbers in `package.json`, `Cargo.toml`, `tauri.conf.json`, or here unless explicitly requested. See [`VERSION_POLICY.md`](VERSION_POLICY.md).
 
@@ -70,16 +70,25 @@ sudo dnf install webkit2gtk4.1-devel openssl-devel curl wget file librsvg2-devel
 
 ### 3. Docker sandbox image (optional)
 
-Required for containerized terminals:
+Required for containerized terminals. The image ships Claude Code, Codex, and
+Cursor CLI (`claude`, `codex`, `cursor-agent` / `agent`). Host CLI updates do
+**not** appear in Docker until you rebuild:
 
 ```bash
 ./handover/docker/build-base.sh
 # or: npm run build:docker-base
+
+# Force reinstall of the latest CLIs (skip Docker layer cache):
+./handover/docker/build-base.sh --no-cache
 ```
+
+Then open a **new** Docker terminal in Handover — existing containers keep the
+old image. Details: [`handover/docker/README.md`](handover/docker/README.md).
 
 ## Features
 
 - **Multi-terminal workspace** — native or Docker-backed PTY sessions per project
+- **AI CLIs in Docker** — Claude Code, Codex, and Cursor CLI (`claude`, `codex`, `cursor-agent` / `agent`); rebuild `handover-base` to pick up host CLI updates
 - **AI handoffs** — summary file or git-commit transfer between terminals
 - **Handoff templates** — `generic`, `nextjs`, `rust-cli` (via `.handover/config.yml`)
 - **Handoff history** — browse, compare diffs, export logs

@@ -59,7 +59,7 @@ impl AppState {
             focused_project_id: RwLock::new(None),
             project_last_active: RwLock::new(HashMap::new()),
             app_config: RwLock::new(json!({
-                "clis_enabled": ["claude", "codex"],
+                "clis_enabled": ["claude", "codex", "cursor"],
                 "auto_suspend_delay": 300,
                 "container_mem_limit": "2g",
             })),

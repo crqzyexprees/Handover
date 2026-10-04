@@ -15,15 +15,20 @@ RUN apt-get update \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Pre-install the supported CLIs globally so they're on PATH in every sandbox.
+# Pre-install Claude Code + Codex globally so they're on PATH in every sandbox.
+# Rebuild this image after host CLI updates — Docker does not inherit host binaries.
 RUN npm install -g @anthropic-ai/claude-code @openai/codex
 
-# Cursor CLI (cursor-agent): the official installer drops it under the build
-# user's ~/.local (i.e. /root, mode 700). Relocate it to a shared path and
+# Cursor CLI (cursor-agent / agent): the official installer drops it under the
+# build user's ~/.local (i.e. /root, mode 700). Relocate it to a shared path and
 # symlink onto PATH so the non-root sandbox user (host UID) can run it.
 RUN curl https://cursor.com/install -fsS | bash \
     && cp -a /root/.local/share/cursor-agent /opt/cursor-agent \
-    && ln -sf /opt/cursor-agent/versions/*/cursor-agent /usr/local/bin/cursor-agent \
+    && LATEST="$(ls -1 /opt/cursor-agent/versions | sort | tail -n1)" \
+    && test -n "$LATEST" \
+    && test -x "/opt/cursor-agent/versions/${LATEST}/cursor-agent" \
+    && ln -sfn "/opt/cursor-agent/versions/${LATEST}/cursor-agent" /usr/local/bin/cursor-agent \
+    && ln -sfn "/opt/cursor-agent/versions/${LATEST}/cursor-agent" /usr/local/bin/agent \
     && chmod -R a+rX /opt/cursor-agent \
     && rm -rf /root/.local
 

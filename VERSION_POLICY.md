@@ -2,7 +2,7 @@
 
 **Do not bump** the app or backend version in any file unless the project owner explicitly requests it.
 
-Current version (leave as-is): **v1.0.7**
+Current version (leave as-is): **v1.0.8**
 
 Files that carry the version (edit only when instructed):
 
