@@ -1,0 +1,13 @@
+---
+description: Never bump Handover version numbers unless the user explicitly asks
+alwaysApply: true
+---
+
+# Version policy
+
+Never change the Handover app/backend version automatically.
+
+- Do not bump `package.json`, `Cargo.toml`, `tauri.conf.json`, README “Current release”, or `VERSION_POLICY.md` unless the user explicitly asks to update the version.
+- Routine fixes, Docker image rebuilds, docs, and AppImage rebuilds stay on the current version.
+- Re-uploading/clobbering the **same** GitHub release asset is allowed when shipping a fix without a version bump.
+- See `VERSION_POLICY.md`.

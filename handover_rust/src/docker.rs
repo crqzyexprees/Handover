@@ -37,10 +37,26 @@ const CONFIG_MOUNTS: &[(&str, &str)] = &[
 const CONFIG_FILE_MOUNTS: &[(&str, &str)] = &[("~/.claude.json", ".claude.json")];
 
 fn copy_config_cmd() -> String {
+    // Host tool dirs (especially ~/.codex) contain absolute symlinks into the
+    // host home (e.g. packages/app-server-daemon/current -> /home/USER/.codex/...).
+    // After copying into /home/sandbox those links break Codex/Claude. Rewrite
+    // them to $HOME and drop host-only runtime state.
     format!(
-        "if [ -d {CONFIG_STAGING_DIR} ]; then \
-         cp -a {CONFIG_STAGING_DIR}/. $HOME/ 2>/dev/null; \
-         chmod -R u+rwX $HOME 2>/dev/null; fi; true"
+        r#"if [ -d {CONFIG_STAGING_DIR} ]; then
+  cp -a {CONFIG_STAGING_DIR}/. "$HOME/" 2>/dev/null || true
+  rm -rf "$HOME/.codex/tmp" "$HOME/.codex/app-server-daemon" 2>/dev/null || true
+  find "$HOME" -type l 2>/dev/null | while IFS= read -r link; do
+    target=$(readlink "$link" 2>/dev/null || true)
+    case "$target" in
+      /home/*/*)
+        rest="${{target#/home/*/}}"
+        ln -sfn "$HOME/$rest" "$link" 2>/dev/null || true
+        ;;
+    esac
+  done
+  chmod -R u+rwX "$HOME" 2>/dev/null || true
+fi
+true"#
     )
 }
 

@@ -9,9 +9,11 @@ Pre-installed CLIs (on `PATH` inside every sandbox):
 - `cursor-agent` / `agent` — Cursor CLI
 
 Host auth/config is copied in at container start (`~/.claude`, `~/.codex`,
-`~/.cursor`, `~/.config/cursor`, etc.). **CLI binaries are not shared from the
-host** — rebuild this image whenever you want newer Claude / Codex / Cursor
-versions in Docker.
+`~/.cursor`, `~/.config/cursor`, etc.). Absolute symlinks inside those dirs
+(e.g. Codex `packages/app-server-daemon/current`) are rewritten to the sandbox
+`$HOME` so tools keep working. **CLI binaries are not shared from the host** —
+rebuild this image whenever you want newer Claude / Codex / Cursor versions in
+Docker.
 
 ```bash
 ./handover/docker/build-base.sh
