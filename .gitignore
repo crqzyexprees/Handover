@@ -50,3 +50,12 @@ __pycache__/
 # Runtime handoff data inside user projects
 .handover/
 .ai-orchestrator/
+
+# Secrets / credentials — never commit (runtime auth only; never bake into images)
+.env
+.env.*
+!.env.example
+**/.credentials.json
+**/auth.json
+*.pem
+*.key

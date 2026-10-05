@@ -40,7 +40,10 @@ fn copy_config_cmd() -> String {
     // Host tool dirs (especially ~/.codex) contain absolute symlinks into the
     // host home (e.g. packages/app-server-daemon/current -> /home/USER/.codex/...).
     // After copying into /home/sandbox those links break Codex/Claude. Rewrite
-    // them to $HOME and drop host-only runtime state.
+    // them to $HOME, drop host-only runtime state, and point ~/.local at the
+    // image-installed Claude (native installer layout).
+    // Auth files from the host are copied into the ephemeral container only —
+    // never baked into the image and never committed to git.
     format!(
         r#"if [ -d {CONFIG_STAGING_DIR} ]; then
   cp -a {CONFIG_STAGING_DIR}/. "$HOME/" 2>/dev/null || true
@@ -55,6 +58,16 @@ fn copy_config_cmd() -> String {
     esac
   done
   chmod -R u+rwX "$HOME" 2>/dev/null || true
+fi
+# Claude native layout expects binaries under $HOME/.local (not only /usr/bin).
+mkdir -p "$HOME/.local/bin" "$HOME/.local/share"
+if [ -d /opt/claude ]; then
+  ln -sfn /opt/claude "$HOME/.local/share/claude"
+fi
+if [ -x /usr/local/bin/claude ]; then
+  ln -sfn /usr/local/bin/claude "$HOME/.local/bin/claude"
+elif command -v claude >/dev/null 2>&1; then
+  ln -sfn "$(command -v claude)" "$HOME/.local/bin/claude"
 fi
 true"#
     )
@@ -92,10 +105,17 @@ impl DockerRuntime {
         let mem_bytes = parse_mem_bytes(mem_limit);
         let nss_path = self._nss_dir.path();
 
-        let mut env = vec![format!("HOME={SANDBOX_HOME}")];
+        let mut env = vec![
+            format!("HOME={SANDBOX_HOME}"),
+            format!("PATH={SANDBOX_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"),
+        ];
+        // Runtime-only: values come from the host process environment.
+        // Never write these into the image, Dockerfile, or git.
         for key in FORWARDED_API_KEYS {
             if let Ok(val) = std::env::var(key) {
-                env.push(format!("{key}={val}"));
+                if !val.trim().is_empty() {
+                    env.push(format!("{key}={val}"));
+                }
             }
         }
         if let Some(custom) = custom_env_vars {

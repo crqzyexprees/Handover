@@ -4,9 +4,14 @@ Builds `handover-base:latest`, used by Rust sandboxes when starting Docker termi
 
 Pre-installed CLIs (on `PATH` inside every sandbox):
 
-- `claude` — Claude Code (`@anthropic-ai/claude-code`)
+- `claude` — Claude Code (native installer under `/opt/claude`, also linked at `~/.local/bin/claude`)
 - `codex` — OpenAI Codex CLI (`@openai/codex`)
 - `cursor-agent` / `agent` — Cursor CLI
+
+**Secrets:** API keys and auth files are **not** baked into the image and must
+never be committed. At container start Handover may forward host env vars
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`) and copy host config dirs into the
+ephemeral sandbox only.
 
 Host auth/config is copied in at container start (`~/.claude`, `~/.codex`,
 `~/.cursor`, `~/.config/cursor`, etc.). Absolute symlinks inside those dirs

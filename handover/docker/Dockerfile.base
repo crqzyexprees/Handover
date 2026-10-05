@@ -2,6 +2,8 @@
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+# Prefer ~/.local/bin (Claude native layout) then system CLIs.
+ENV PATH="/home/sandbox/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -9,19 +11,30 @@ RUN apt-get update \
         git \
         ca-certificates \
         gnupg \
-    # NodeSource provides an up-to-date Node.js (bundles npm).
+        zstd \
+    # NodeSource provides an up-to-date Node.js (bundles npm) — used for Codex.
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Pre-install Claude Code + Codex globally so they're on PATH in every sandbox.
-# Rebuild this image after host CLI updates — Docker does not inherit host binaries.
-RUN npm install -g @anthropic-ai/claude-code @openai/codex
+# Codex via npm (global). Rebuild this image after host CLI updates —
+# Docker does not inherit host binaries or host API keys.
+RUN npm install -g @openai/codex
 
-# Cursor CLI (cursor-agent / agent): the official installer drops it under the
-# build user's ~/.local (i.e. /root, mode 700). Relocate it to a shared path and
-# symlink onto PATH so the non-root sandbox user (host UID) can run it.
+# Claude Code native installer (same layout as host ~/.local/share/claude).
+# Install as root into /root/.local, then relocate under /opt for the sandbox user.
+# Do NOT bake credentials into the image — auth is copied at container start only.
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && cp -a /root/.local/share/claude /opt/claude \
+    && LATEST="$(ls -1 /opt/claude/versions | sort -V | tail -n1)" \
+    && test -n "$LATEST" \
+    && test -x "/opt/claude/versions/${LATEST}" \
+    && ln -sfn "/opt/claude/versions/${LATEST}" /usr/local/bin/claude \
+    && chmod -R a+rX /opt/claude \
+    && rm -rf /root/.local /root/.claude
+
+# Cursor CLI (cursor-agent / agent): relocate out of root's ~/.local onto PATH.
 RUN curl https://cursor.com/install -fsS | bash \
     && cp -a /root/.local/share/cursor-agent /opt/cursor-agent \
     && LATEST="$(ls -1 /opt/cursor-agent/versions | sort | tail -n1)" \
@@ -36,6 +49,10 @@ RUN curl https://cursor.com/install -fsS | bash \
 # UID. Host auth/config dirs are mounted in here read-only at runtime, and the
 # CLIs need a writable HOME for their own state. World-writable because the
 # runtime UID isn't known at build time; the container is ephemeral anyway.
-RUN mkdir -p /home/sandbox && chmod 777 /home/sandbox
+# Seed ~/.local so Claude finds its native binary layout under $HOME.
+RUN mkdir -p /home/sandbox/.local/bin /home/sandbox/.local/share \
+    && ln -sfn /opt/claude /home/sandbox/.local/share/claude \
+    && ln -sfn /usr/local/bin/claude /home/sandbox/.local/bin/claude \
+    && chmod -R a+rwX /home/sandbox
 
 WORKDIR /workspace
