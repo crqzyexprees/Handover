@@ -1,4 +1,5 @@
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -22,19 +23,37 @@ fn pick_free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// One plain-HTTP `GET /` against the local backend; true on a 2xx status.
+fn backend_responds(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let request = format!("GET / HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut status_line = String::new();
+    if BufReader::new(stream).read_line(&mut status_line).is_err() {
+        return false;
+    }
+    // "HTTP/1.1 200 OK"
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|code| code.starts_with('2'))
+}
+
 fn wait_for_backend(port: u16) -> Result<()> {
-    let client = reqwest::blocking::Client::new();
-    let url = format!("http://127.0.0.1:{port}/");
     let deadline = Instant::now() + Duration::from_secs(120);
     while Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).send() {
-            if resp.status().is_success() {
-                return Ok(());
-            }
+        if backend_responds(port) {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    anyhow::bail!("handover-backend did not respond on {url}")
+    anyhow::bail!("handover-backend did not respond on http://127.0.0.1:{port}/")
 }
 
 fn spawn_backend(app: &tauri::AppHandle, port: u16) -> Result<CommandChild> {

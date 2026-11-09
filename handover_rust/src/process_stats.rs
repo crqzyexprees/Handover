@@ -19,14 +19,16 @@ pub fn process_tree_stats_batch(root_pids: &[u32]) -> Vec<(u32, Value)> {
         return Vec::new();
     }
 
-    let mut sys = System::new_with_specifics(
+    let Ok(mut sys) = System::new_with_specifics(
         RefreshKind::nothing().with_processes(
             ProcessRefreshKind::nothing()
                 .with_cpu()
                 .with_memory()
                 .with_cmd(UpdateKind::OnlyIfNotSet),
         ),
-    );
+    ) else {
+        return root_pids.iter().map(|&pid| (pid, zeros())).collect();
+    };
 
     // First sample seeds CPU counters; second sample yields usable percentages.
     sys.refresh_processes(ProcessesToUpdate::All, true);

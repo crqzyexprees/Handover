@@ -1,9 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { Terminal } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
-import '@xterm/xterm/css/xterm.css'
 import { getInstanceStats } from './api'
-import { connectPtyBridge } from './ptyBridge.js'
+import './terminalSessionDeps.js'
+import { TerminalSession } from './terminalSession.js'
 import { attachTerminalShortcuts } from './terminalShortcuts.js'
 
 const STATS_POLL_MS = 5000
@@ -21,18 +19,16 @@ const STATUS_COLOR = {
 }
 
 /**
- * One persistent terminal session per instanceId (native or docker).
+ * Thin view over a TerminalSession (one per instanceId, native or docker).
  * When inactive, stay mounted + connected — only hide visually so scrollback survives tab switches.
  */
 export default function TerminalView({ instanceId, isActive = true, onConnectionChange }) {
   const containerRef = useRef(null)
-  const termRef = useRef(null)
-  const fitAddonRef = useRef(null)
+  const sessionRef = useRef(null)
   const isActiveRef = useRef(isActive)
   const onConnectionChangeRef = useRef(onConnectionChange)
   const [statsState, setStatsState] = useState(null)
   const [connectionStatus, setConnectionStatus] = useState('disconnected')
-  const [reconnectNonce, setReconnectNonce] = useState(0)
 
   useEffect(() => {
     onConnectionChangeRef.current = onConnectionChange
@@ -42,94 +38,41 @@ export default function TerminalView({ instanceId, isActive = true, onConnection
     isActiveRef.current = isActive
   }, [isActive])
 
-  // Create xterm + WS once per instanceId. Tab switches must NOT remount this.
+  // One session per instanceId. Tab switches and reconnects must NOT remount it.
   useEffect(() => {
     if (instanceId == null || instanceId === '') return
-
     const container = containerRef.current
     if (!container) return
 
-    container.replaceChildren()
-
-    const term = new Terminal({
-      cursorBlink: true,
-      fontSize: 14,
-      fontFamily: 'JetBrains Mono, Fira Code, monospace',
-      rightClickSelectsWord: true,
-      scrollback: 5000,
-      theme: {
-        background: '#0f1117',
-        foreground: '#e2e8f0',
-        cursor: '#60a5fa',
-        selectionBackground: '#264f78',
-      },
-    })
-
-    const fitAddon = new FitAddon()
-    term.loadAddon(fitAddon)
-    term.open(container)
-    termRef.current = term
-    fitAddonRef.current = fitAddon
-
-    const detachShortcuts = attachTerminalShortcuts(term, container, instanceId)
-
-    const resizeObserver = new ResizeObserver(() => {
-      try {
-        fitAddon.fit()
-      } catch {
-        // ignore zero-size layout
-      }
-    })
-    resizeObserver.observe(container)
+    const session = new TerminalSession({ instanceId, container })
+    sessionRef.current = session
 
     const report = (status) => {
       setConnectionStatus(status)
       onConnectionChangeRef.current?.(instanceId, status)
     }
-
-    const disconnectBridge = connectPtyBridge({
-      instanceId,
-      term,
-      fitAddon,
-      report,
-    })
+    report(session.status)
+    const unsubscribe = session.onStatus(report)
+    const detachShortcuts = attachTerminalShortcuts(session, container)
 
     const focusTimer = window.setTimeout(() => {
-      if (!isActiveRef.current) return
-      try {
-        term.focus()
-        fitAddon.fit()
-      } catch {
-        // ignore
-      }
+      if (isActiveRef.current) session.focus()
     }, 50)
 
     return () => {
       window.clearTimeout(focusTimer)
-      resizeObserver.disconnect()
       detachShortcuts()
-      disconnectBridge()
-      termRef.current = null
-      fitAddonRef.current = null
-      term.dispose()
+      unsubscribe()
+      session.dispose()
+      onConnectionChangeRef.current?.(instanceId, 'disconnected')
+      sessionRef.current = null
     }
-  }, [instanceId, reconnectNonce])
+  }, [instanceId])
 
   // When tab becomes active: refit + focus (no reconnect / no PTY respawn).
   useEffect(() => {
     if (!isActive) return
-    const timer = window.setTimeout(() => {
-      try {
-        fitAddonRef.current?.fit()
-        const term = termRef.current
-        if (term) {
-          term.refresh(0, Math.max(0, term.rows - 1))
-          term.focus()
-        }
-      } catch {
-        // layout may still be settling
-      }
-    }, 0)
+    const timer = window.setTimeout(() => sessionRef.current?.focus(), 0)
     return () => window.clearTimeout(timer)
   }, [isActive, instanceId])
 
@@ -177,7 +120,7 @@ export default function TerminalView({ instanceId, isActive = true, onConnection
           className="relative min-h-0 min-w-0 flex-1"
           onClick={() => {
             if (!isActive) return
-            termRef.current?.focus()
+            sessionRef.current?.focus()
           }}
         >
           <div ref={containerRef} className="h-full min-h-0 min-w-0" />
@@ -202,7 +145,7 @@ export default function TerminalView({ instanceId, isActive = true, onConnection
                 {connectionStatus === 'disconnected' ? (
                   <button
                     type="button"
-                    onClick={() => setReconnectNonce((n) => n + 1)}
+                    onClick={() => sessionRef.current?.reconnect()}
                     className="pointer-events-auto cursor-pointer border-0 bg-transparent p-0 text-[#808080] hover:text-[#cccccc]"
                     title="Reconnect terminal"
                     aria-label="Reconnect terminal"
@@ -212,7 +155,7 @@ export default function TerminalView({ instanceId, isActive = true, onConnection
                 ) : null}
                 <button
                   type="button"
-                  onClick={() => termRef.current?.clear()}
+                  onClick={() => sessionRef.current?.clear()}
                   className="pointer-events-auto cursor-pointer border-0 bg-transparent p-0 text-[#808080] leading-none hover:text-[#a0a0a0]"
                   title="Clear terminal"
                   aria-label="Clear terminal"

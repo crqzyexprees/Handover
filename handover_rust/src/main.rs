@@ -980,12 +980,21 @@ async fn project_resources(
     }
 
     use sysinfo::{MemoryRefreshKind, RefreshKind, System};
-    let mut sys = System::new_with_specifics(
+    let (total_mb, used_mb) = match System::new_with_specifics(
         RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
-    );
-    sys.refresh_memory();
-    let total_mb = sys.total_memory() as f64 / (1024.0 * 1024.0);
-    let used_mb = sys.used_memory() as f64 / (1024.0 * 1024.0);
+    ) {
+        Ok(mut sys) => {
+            sys.refresh_memory();
+            (
+                sys.total_memory() as f64 / (1024.0 * 1024.0),
+                sys.used_memory() as f64 / (1024.0 * 1024.0),
+            )
+        }
+        Err(e) => {
+            warn!("failed to read host memory: {e}");
+            (0.0, 0.0)
+        }
+    };
     let ram_percent = if total_mb > 0.0 {
         used_mb / total_mb * 100.0
     } else {

@@ -1,5 +1,5 @@
-# Base sandbox image: Ubuntu 22.04 with the common toolchain every CLI needs.
-FROM ubuntu:22.04
+# Base sandbox image: Ubuntu 24.04 LTS with the common toolchain every CLI needs.
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 # Prefer ~/.local/bin (Claude native layout) then system CLIs.
@@ -14,8 +14,8 @@ RUN apt-get update \
         ca-certificates \
         gnupg \
         zstd \
-    # NodeSource provides an up-to-date Node.js (bundles npm) — used for Codex.
-    && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    # NodeSource Node.js 24 LTS (bundles npm) — used for Codex.
+    && curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

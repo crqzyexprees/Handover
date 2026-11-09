@@ -3,7 +3,6 @@
  * Ctrl+Shift+C/V, Ctrl+Insert, Shift+Insert, select-all, font zoom.
  */
 import { readClipboard, writeClipboard } from './clipboard.js'
-import { pasteIntoTerminal } from './ptyBridge.js'
 
 const DEFAULT_FONT_SIZE = 14
 const MIN_FONT_SIZE = 8
@@ -16,26 +15,14 @@ async function copySelection(term) {
   return writeClipboard(selection)
 }
 
-async function pasteFromClipboard(term, instanceId) {
-  const text = await readClipboard()
-  pasteText(term, text, instanceId)
+async function pasteFromClipboard(session) {
+  pasteText(session, await readClipboard())
 }
 
-function pasteText(term, text, instanceId) {
+function pasteText(session, text) {
   if (!text) return
-  try {
-    // xterm.paste normalizes newlines and wraps with bracketed-paste
-    // markers when the shell has enabled that mode (safe multi-line).
-    // Goes through this term's onData → that instance's WebSocket.
-    term.paste(text)
-  } catch {
-    pasteIntoTerminal(text, instanceId)
-  }
-  try {
-    term.focus()
-  } catch {
-    // ignore
-  }
+  session.paste(text)
+  session.term.focus()
 }
 
 function isModifierOnly(event) {
@@ -51,12 +38,12 @@ function handleZoom(term, delta) {
 }
 
 /**
- * @param {import('@xterm/xterm').Terminal} term
+ * @param {import('./terminalSession.js').TerminalSession} session
  * @param {HTMLElement} container
- * @param {string} [instanceId]
  * @returns {() => void}
  */
-export function attachTerminalShortcuts(term, container, instanceId) {
+export function attachTerminalShortcuts(session, container) {
+  const term = session.term
   term.attachCustomKeyEventHandler((event) => {
     if (event.type !== 'keydown' || isModifierOnly(event)) {
       return true
@@ -83,7 +70,7 @@ export function attachTerminalShortcuts(term, container, instanceId) {
     // Ctrl+Shift+V — paste
     if (ctrl && shift && (key === 'v' || key === 'V')) {
       event.preventDefault()
-      void pasteFromClipboard(term, instanceId)
+      void pasteFromClipboard(session)
       return false
     }
 
@@ -104,7 +91,7 @@ export function attachTerminalShortcuts(term, container, instanceId) {
     // Shift+Insert — paste
     if (!ctrl && shift && key === 'Insert') {
       event.preventDefault()
-      void pasteFromClipboard(term, instanceId)
+      void pasteFromClipboard(session)
       return false
     }
 
@@ -154,9 +141,9 @@ export function attachTerminalShortcuts(term, container, instanceId) {
       event.preventDefault()
       const selection = term.hasSelection() ? term.getSelection() : ''
       if (selection) {
-        pasteText(term, selection, instanceId)
+        pasteText(session, selection)
       } else {
-        void pasteFromClipboard(term, instanceId)
+        void pasteFromClipboard(session)
       }
     }
     // Right-click copy is handled once, in onContextMenu.

@@ -12,9 +12,15 @@ use crate::state::{
 
 pub fn spawn_governor(state: Arc<AppState>, docker_slot: Arc<RwLock<Option<Arc<DockerRuntime>>>>) {
     tokio::spawn(async move {
-        let mut sys = System::new_with_specifics(
+        let mut sys = match System::new_with_specifics(
             RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
-        );
+        ) {
+            Ok(sys) => sys,
+            Err(e) => {
+                warn!("[governor] disabled: cannot read host memory: {e}");
+                return;
+            }
+        };
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(GOVERNOR_INTERVAL_SECS)).await;
             let docker = docker_slot.read().await.clone();

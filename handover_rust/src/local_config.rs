@@ -39,7 +39,7 @@ pub async fn read_local_config(project_path: &str) -> Result<Option<Value>> {
     if content.trim().is_empty() {
         return Ok(None);
     }
-    let parsed: Value = serde_yaml::from_str(&content)
+    let parsed: Value = serde_norway::from_str(&content)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(Some(sanitize_local_config(parsed)))
 }
@@ -96,7 +96,7 @@ pub async fn write_local_config(project_path: &str, config: &Value) -> Result<()
         "custom_env_vars": custom_env_vars,
     });
 
-    let yaml = serde_yaml::to_string(&doc).context("failed to serialize config.yml")?;
+    let yaml = serde_norway::to_string(&doc).context("failed to serialize config.yml")?;
     fs::write(&path, yaml)
         .await
         .with_context(|| format!("failed to write {}", path.display()))?;

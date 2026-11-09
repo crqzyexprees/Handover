@@ -1,7 +1,7 @@
 {
   "name": "handover-repo",
   "private": true,
-  "description": "Handover monorepo root — app lives in handover_app/",
+  "description": "Handover monorepo root \u2014 app lives in handover_app/",
   "workspaces": [
     "handover_app"
   ],
@@ -13,6 +13,7 @@
     "build:backend": "npm run build:backend -w handover",
     "build:docker-base": "npm run build:docker-base -w handover",
     "lint": "npm run lint -w handover",
-    "preview": "npm run preview -w handover"
+    "preview": "npm run preview -w handover",
+    "test": "npm run test -w handover"
   }
 }

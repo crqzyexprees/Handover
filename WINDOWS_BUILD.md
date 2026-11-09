@@ -295,7 +295,7 @@ Tauri bundles the sidecar next to the app and starts it at runtime.
 - Sidecar packaging script (`prepare-backend-sidecar.js`) for Windows
 - REST API, project persistence, handoffs UI
 - Docker mode **if Docker Desktop is installed and the base image is built**
-- Terminal input bridge (`handover_app/src/ptyBridge.js`) — frontend is OS-agnostic
+- Terminal session (`handover_app/src/terminalSession.js`) — frontend is OS-agnostic
 
 ### What still needs Windows validation
 

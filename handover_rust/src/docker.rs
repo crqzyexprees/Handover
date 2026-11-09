@@ -2,12 +2,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
-    StartContainerOptions, Stats, StatsOptions,
-};
 use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::models::{ContainerStateStatusEnum, HostConfig};
+use bollard::models::{
+    ContainerCpuStats, ContainerCreateBody, ContainerStateStatusEnum, ContainerStatsResponse,
+    HostConfig,
+};
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
+    StartContainerOptions, StatsOptionsBuilder,
+};
 use bollard::Docker;
 use futures::StreamExt;
 use serde_json::json;
@@ -165,7 +168,7 @@ impl DockerRuntime {
             ..Default::default()
         };
 
-        let config = Config {
+        let config = ContainerCreateBody {
             image: Some(BASE_IMAGE.to_string()),
             cmd: Some(vec!["/bin/bash".into()]),
             tty: Some(true),
@@ -182,17 +185,14 @@ impl DockerRuntime {
         let create = self
             .docker
             .create_container(
-                Some(CreateContainerOptions {
-                    name,
-                    platform: None,
-                }),
+                Some(CreateContainerOptionsBuilder::default().name(&name).build()),
                 config,
             )
             .await?;
 
         let id = create.id;
         self.docker
-            .start_container(&id, None::<StartContainerOptions<String>>)
+            .start_container(&id, None::<StartContainerOptions>)
             .await?;
 
         let exec = self
@@ -223,10 +223,7 @@ impl DockerRuntime {
         self.docker
             .remove_container(
                 container_id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
             .await
             .with_context(|| format!("failed to remove container {container_id}"))?;
@@ -266,10 +263,12 @@ impl DockerRuntime {
 
         let mut stream = self.docker.stats(
             container_id,
-            Some(StatsOptions {
-                stream: false,
-                one_shot: true,
-            }),
+            Some(
+                StatsOptionsBuilder::default()
+                    .stream(false)
+                    .one_shot(true)
+                    .build(),
+            ),
         );
         let stats = match stream.next().await {
             Some(Ok(s)) => s,
@@ -288,11 +287,12 @@ impl DockerRuntime {
         filters.insert("label".to_string(), vec![INSTANCE_LABEL.to_string()]);
         let list = self
             .docker
-            .list_containers(Some(ListContainersOptions {
-                all: true,
-                filters,
-                ..Default::default()
-            }))
+            .list_containers(Some(
+                ListContainersOptionsBuilder::default()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
+            ))
             .await
             .unwrap_or_default();
         let count = list.len();
@@ -302,10 +302,7 @@ impl DockerRuntime {
                     .docker
                     .remove_container(
                         &id,
-                        Some(RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
+                        Some(RemoveContainerOptionsBuilder::default().force(true).build()),
                     )
                     .await;
             }
@@ -383,12 +380,17 @@ fn build_nss_files() -> Result<TempDir> {
     Ok(dir)
 }
 
-fn cpu_percent(stats: &Stats) -> f64 {
-    let cpu = &stats.cpu_stats;
-    let precpu = &stats.precpu_stats;
-    let usage = &cpu.cpu_usage;
-    let pre_usage = &precpu.cpu_usage;
-    let cpu_delta = usage.total_usage.saturating_sub(pre_usage.total_usage);
+fn cpu_percent(stats: &ContainerStatsResponse) -> f64 {
+    let (Some(cpu), Some(precpu)) = (&stats.cpu_stats, &stats.precpu_stats) else {
+        return 0.0;
+    };
+    let total = |c: &ContainerCpuStats| {
+        c.cpu_usage
+            .as_ref()
+            .and_then(|u| u.total_usage)
+            .unwrap_or(0)
+    };
+    let cpu_delta = total(cpu).saturating_sub(total(precpu));
     let system_delta = cpu
         .system_cpu_usage
         .unwrap_or(0)
@@ -398,24 +400,42 @@ fn cpu_percent(stats: &Stats) -> f64 {
     }
     let online_cpus = cpu
         .online_cpus
-        .or_else(|| usage.percpu_usage.as_ref().map(|p| p.len() as u64))
+        .map(u64::from)
+        .or_else(|| {
+            cpu.cpu_usage
+                .as_ref()
+                .and_then(|u| u.percpu_usage.as_ref())
+                .map(|p| p.len() as u64)
+        })
         .unwrap_or(1) as f64;
     ((cpu_delta as f64 / system_delta as f64) * online_cpus * 100.0 * 10.0).round() / 10.0
 }
 
-fn mem_used_mb(stats: &Stats) -> f64 {
-    let mem = &stats.memory_stats;
+fn mem_used_mb(stats: &ContainerStatsResponse) -> f64 {
+    let Some(mem) = &stats.memory_stats else {
+        return 0.0;
+    };
     let usage = mem.usage.unwrap_or(0) as i64;
-    let cache = match mem.stats {
-        Some(bollard::container::MemoryStatsStats::V1(s)) => s.inactive_file,
-        Some(bollard::container::MemoryStatsStats::V2(s)) => s.inactive_file,
-        None => 0,
-    } as i64;
+    // Same rule as the docker CLI: cgroup v1 reports total_inactive_file,
+    // cgroup v2 reports inactive_file.
+    let cache = mem
+        .stats
+        .as_ref()
+        .and_then(|s| {
+            s.get("total_inactive_file")
+                .or_else(|| s.get("inactive_file"))
+        })
+        .copied()
+        .unwrap_or(0) as i64;
     ((usage - cache).max(0) as f64 / (1024.0 * 1024.0) * 10.0).round() / 10.0
 }
 
-fn mem_limit_mb(stats: &Stats) -> f64 {
-    let limit = stats.memory_stats.limit.unwrap_or(0) as f64;
+fn mem_limit_mb(stats: &ContainerStatsResponse) -> f64 {
+    let limit = stats
+        .memory_stats
+        .as_ref()
+        .and_then(|m| m.limit)
+        .unwrap_or(0) as f64;
     (limit / (1024.0 * 1024.0) * 10.0).round() / 10.0
 }
 

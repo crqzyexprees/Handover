@@ -18,6 +18,10 @@ The embedded terminal uses the same protocol as the original Python backend:
 
 `xterm onData → WebSocket text → PTY → WebSocket text → xterm write`
 
+On the frontend, `handover_app/src/terminalSession.js` owns this whole path:
+one `TerminalSession` per terminal holds the xterm, the WebSocket, paste and
+decoding, so every keystroke and paste goes through a single write path.
+
 If typing fails after code changes, do a **full restart** (not hot reload):
 
 ```bash
@@ -158,6 +162,7 @@ HANDOVER_VERBOSE=1 RUST_LOG=info npm run dev:tauri
 | `npm run build:backend` | Rust release binary only |
 | `npm run build:docker-base` | Build `handover-base:latest` image |
 | `npm run lint` | ESLint on frontend |
+| `npm test` | Frontend unit tests (Vitest) |
 
 ## License
 
