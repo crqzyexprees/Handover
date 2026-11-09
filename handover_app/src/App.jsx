@@ -512,7 +512,7 @@ export default function App() {
         pushToast(result.message, 'error', 9000)
         return false
       }
-      const isSummarySuccess = result.message.includes('wrote the handoff file')
+      const isSummarySuccess = result.kind === 'summary_written'
       pushToast(result.message ?? 'Handover complete', 'success', isSummarySuccess ? 7000 : 5000)
       return true
     },

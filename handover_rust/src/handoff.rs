@@ -286,10 +286,28 @@ pub async fn diff_handoff_files(project_path: &str, from: &str, to: &str) -> Res
     Ok(unified_line_diff(from, to, &from_text, &to_text))
 }
 
-pub fn git_diff_range(project_path: &str, from_ref: &str, to_ref: &str) -> Result<String> {
-    let output = std::process::Command::new("git")
-        .args(["-C", project_path, "diff", from_ref, to_ref])
+/// Rejects refs git could parse as options (e.g. `--output=/path`).
+fn validate_git_ref(r: &str) -> Result<()> {
+    if r.is_empty() || r.starts_with('-') || r.chars().any(|c| c.is_control()) {
+        anyhow::bail!("invalid git ref: {r:?}");
+    }
+    Ok(())
+}
+
+pub async fn git_diff_range(project_path: &str, from_ref: &str, to_ref: &str) -> Result<String> {
+    validate_git_ref(from_ref)?;
+    validate_git_ref(to_ref)?;
+    let output = tokio::process::Command::new("git")
+        .args([
+            "-C",
+            project_path,
+            "diff",
+            "--end-of-options",
+            from_ref,
+            to_ref,
+        ])
         .output()
+        .await
         .context("failed to spawn git")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -309,6 +327,15 @@ fn unified_line_diff(from_label: &str, to_label: &str, from_text: &str, to_text:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_git_ref_rejects_option_like_refs() {
+        assert!(validate_git_ref("--output=/tmp/x").is_err());
+        assert!(validate_git_ref("-p").is_err());
+        assert!(validate_git_ref("").is_err());
+        assert!(validate_git_ref("HEAD~1").is_ok());
+        assert!(validate_git_ref("a2c5028").is_ok());
+    }
     use git2::Repository;
 
     #[test]

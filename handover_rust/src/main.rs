@@ -309,11 +309,13 @@ async fn merged_project_config(
     let file_config = local_config::read_local_config(path)
         .await
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let mut merged = base;
+    // Precedence (later wins): defaults < app-persisted < .handover/config.yml.
+    // Saving from the UI writes both, so they agree; a hand edit to the
+    // file must win over the stale persisted copy.
+    let mut merged = local_config::merge_config_values(base, persisted);
     if let Some(file) = file_config {
         merged = local_config::merge_config_values(merged, file);
     }
-    merged = local_config::merge_config_values(merged, persisted);
     Ok(merged)
 }
 
@@ -550,6 +552,12 @@ async fn start_instance(
     if body.sandbox_mode == "native" {
         if let Some(obj) = instance.as_object_mut() {
             obj.insert("container_id".into(), Value::Null);
+            // Applied to the native shell when its PTY is spawned (pty.rs).
+            // Kept in memory only; instances are never persisted.
+            obj.insert(
+                "custom_env_vars".into(),
+                json!(body.custom_env_vars.clone().unwrap_or_default()),
+            );
         }
     } else {
         let docker = get_docker(&ctx).await?;
@@ -630,11 +638,9 @@ async fn instance_stats(
         .get(&instance_id)
         .and_then(|s| s.shell_pid);
     let stats = match shell_pid {
-        Some(pid) => {
-            tokio::task::spawn_blocking(move || process_stats::process_tree_stats(pid))
-                .await
-                .unwrap_or_else(|_| process_stats::zeros())
-        }
+        Some(pid) => tokio::task::spawn_blocking(move || process_stats::process_tree_stats(pid))
+            .await
+            .unwrap_or_else(|_| process_stats::zeros()),
         None => process_stats::zeros(),
     };
     Ok(Json(stats))
@@ -650,16 +656,34 @@ async fn focus_instance(
     Ok(Json(json!({ "status": "ok" })))
 }
 
+/// Collapses a prompt to one line so it is submitted once: interior newlines
+/// would otherwise be read as several separate submissions.
+fn prompt_as_single_line(prompt: &str) -> String {
+    prompt.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Types `prompt` into the instance's terminal and submits it with `\r`
+/// (what the Enter key sends). Raw-mode TUIs such as Claude Code treat `\n`
+/// as "insert newline", not "submit". The submit key is sent separately after
+/// a short pause so TUIs don't fold it into the pasted text.
 async fn send_prompt_to_instance(state: &AppState, instance_id: &str, prompt: &str) -> bool {
-    if let Some(session) = state.pty_sessions.read().await.get(instance_id) {
-        let _ = session.input_tx.send(b"\n".to_vec());
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let mut line = prompt.as_bytes().to_vec();
-        line.push(b'\n');
-        let _ = session.input_tx.send(line);
-        return true;
+    let Some(input_tx) = state
+        .pty_sessions
+        .read()
+        .await
+        .get(instance_id)
+        .map(|s| s.input_tx.clone())
+    else {
+        return false;
+    };
+    if input_tx
+        .send(prompt_as_single_line(prompt).into_bytes())
+        .is_err()
+    {
+        return false;
     }
-    false
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    input_tx.send(b"\r".to_vec()).is_ok()
 }
 
 async fn execute_handoff(
@@ -718,6 +742,7 @@ async fn execute_handoff(
         .ok_or_else(|| api_err(StatusCode::INTERNAL_SERVER_ERROR, "project path missing"))?;
 
     let mut handoff_message = "Handoff complete".to_string();
+    let mut handoff_kind = "git_committed";
     let injection_prompt = if body.method == "git" {
         let outcome = match handoff::git_handoff(
             project_path,
@@ -731,6 +756,7 @@ async fn execute_handoff(
                     StatusCode::BAD_REQUEST,
                     Json(json!({
                         "status": "error",
+                        "kind": "not_git_repo",
                         "message": "Project is not a Git repository. Initialize git first or use Summary handoff."
                     })),
                 )
@@ -742,6 +768,7 @@ async fn execute_handoff(
                 "You are taking over this project. The previous AI just committed their work. Please review the latest git commit using 'git log -1 -p' to understand the current state of the codebase. Your overall goal is: {task}. Continue working on this goal from where the previous AI left off."
             }
             handoff::GitHandoffOutcome::NoChanges => {
+                handoff_kind = "git_no_changes";
                 handoff_message = "Handoff complete; no git changes needed a new commit".to_string();
                 "You are taking over this project. The previous AI found no uncommitted changes to checkpoint. Please inspect the current worktree and recent history with 'git status' and 'git log -1 --stat'. Your overall goal is: {task}. Continue working on this goal from where the previous AI left off."
             }
@@ -787,12 +814,14 @@ async fn execute_handoff(
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "status": "error",
+                    "kind": "summary_timed_out",
                     "message": "Source AI did not create a handoff file within 60 seconds. A fallback handoff file was written with only the goal you provided; review it before handing off manually."
                 })),
             )
                 .into_response());
         }
 
+        handoff_kind = "summary_written";
         handoff_message =
             "Source AI wrote the handoff file; target AI was directed to read it".to_string();
         format!(
@@ -808,7 +837,10 @@ async fn execute_handoff(
         ));
     }
 
-    Ok(Json(json!({ "status": "ok", "message": handoff_message })).into_response())
+    Ok(
+        Json(json!({ "status": "ok", "kind": handoff_kind, "message": handoff_message }))
+            .into_response(),
+    )
 }
 
 async fn project_path_for(ctx: &ServerCtx, project_id: &str) -> Result<String, Response> {
@@ -888,6 +920,7 @@ async fn project_git_diff(
 ) -> Result<Json<Value>, Response> {
     let path = project_path_for(&ctx, &project_id).await?;
     let diff = handoff::git_diff_range(&path, &q.from, &q.to)
+        .await
         .map_err(|e| api_err(StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(Json(json!({ "from": q.from, "to": q.to, "diff": diff })))
 }
@@ -1156,6 +1189,14 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn prompt_as_single_line_collapses_newlines() {
+        assert_eq!(
+            prompt_as_single_line("  fix\nthe\r\n  bug \n"),
+            "fix the bug"
+        );
+    }
 
     #[test]
     fn validate_project_path_accepts_existing_directory() {

@@ -18,6 +18,10 @@ async function copySelection(term) {
 
 async function pasteFromClipboard(term, instanceId) {
   const text = await readClipboard()
+  pasteText(term, text, instanceId)
+}
+
+function pasteText(term, text, instanceId) {
   if (!text) return
   try {
     // xterm.paste normalizes newlines and wraps with bracketed-paste
@@ -143,18 +147,19 @@ export function attachTerminalShortcuts(term, container, instanceId) {
   })
 
   const onMouseDown = (event) => {
-    // Middle-click paste (Linux)
+    // Middle-click paste (Linux). The webview can't read the X11/Wayland
+    // primary selection, so approximate it: paste this terminal's current
+    // selection if there is one, otherwise the clipboard.
     if (event.button === 1) {
       event.preventDefault()
-      void pasteFromClipboard(term, instanceId)
-      return
+      const selection = term.hasSelection() ? term.getSelection() : ''
+      if (selection) {
+        pasteText(term, selection, instanceId)
+      } else {
+        void pasteFromClipboard(term, instanceId)
+      }
     }
-
-    // Right-click copy when text is selected
-    if (event.button === 2 && term.hasSelection()) {
-      event.preventDefault()
-      void copySelection(term)
-    }
+    // Right-click copy is handled once, in onContextMenu.
   }
 
   const onContextMenu = (event) => {

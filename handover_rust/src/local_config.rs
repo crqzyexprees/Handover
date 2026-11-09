@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use tokio::fs;
 
-use crate::state::{basename_from_path, default_project_config, DEFAULT_MEM_LIMIT};
+use crate::state::{
+    basename_from_path, DEFAULT_MEM_LIMIT, HANDOFF_METHODS, HANDOFF_TEMPLATES, SANDBOX_MODES,
+};
 
 pub fn config_yml_path(project_path: &str) -> PathBuf {
     Path::new(project_path).join(".handover/config.yml")
@@ -39,7 +41,7 @@ pub async fn read_local_config(project_path: &str) -> Result<Option<Value>> {
     }
     let parsed: Value = serde_yaml::from_str(&content)
         .with_context(|| format!("failed to parse {}", path.display()))?;
-    Ok(Some(normalize_local_config(parsed, project_path)))
+    Ok(Some(sanitize_local_config(parsed)))
 }
 
 pub async fn write_local_config(project_path: &str, config: &Value) -> Result<()> {
@@ -101,20 +103,44 @@ pub async fn write_local_config(project_path: &str, config: &Value) -> Result<()
     Ok(())
 }
 
-fn normalize_local_config(raw: Value, project_path: &str) -> Value {
-    let defaults = default_project_config(project_path);
+/// Keeps only the keys actually present in the file (so a partial file
+/// doesn't reset other settings to defaults) and drops values outside the
+/// allowed sets.
+fn sanitize_local_config(raw: Value) -> Value {
     let mut overlay = json!({});
-    if let Some(obj) = raw.as_object() {
-        for (key, value) in obj {
-            overlay[key] = value.clone();
+    let Some(obj) = raw.as_object() else {
+        return overlay;
+    };
+    for (key, value) in obj {
+        let allowed: Option<&[&str]> = match key.as_str() {
+            "sandbox_mode" => Some(SANDBOX_MODES),
+            "handoff_method" => Some(HANDOFF_METHODS),
+            "handoff_template" => Some(HANDOFF_TEMPLATES),
+            _ => None,
+        };
+        if let Some(allowed) = allowed {
+            if !value.as_str().is_some_and(|v| allowed.contains(&v)) {
+                continue;
+            }
         }
+        if value.is_null() {
+            continue;
+        }
+        overlay[key] = value.clone();
     }
-    merge_config_values(defaults, overlay)
+    overlay
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_local_config_keeps_only_present_valid_keys() {
+        let raw = json!({ "mem_limit": "4g", "sandbox_mode": "bogus", "handoff_method": "git" });
+        let out = sanitize_local_config(raw);
+        assert_eq!(out, json!({ "mem_limit": "4g", "handoff_method": "git" }));
+    }
 
     #[test]
     fn merge_config_values_overlay_wins() {

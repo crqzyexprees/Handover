@@ -4,6 +4,8 @@ FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 # Prefer ~/.local/bin (Claude native layout) then system CLIs.
 ENV PATH="/home/sandbox/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# /opt/claude is read-only for the sandbox user; update by rebuilding the image.
+ENV DISABLE_AUTOUPDATER=1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -37,7 +39,7 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
 # Cursor CLI (cursor-agent / agent): relocate out of root's ~/.local onto PATH.
 RUN curl https://cursor.com/install -fsS | bash \
     && cp -a /root/.local/share/cursor-agent /opt/cursor-agent \
-    && LATEST="$(ls -1 /opt/cursor-agent/versions | sort | tail -n1)" \
+    && LATEST="$(ls -1 /opt/cursor-agent/versions | sort -V | tail -n1)" \
     && test -n "$LATEST" \
     && test -x "/opt/cursor-agent/versions/${LATEST}/cursor-agent" \
     && ln -sfn "/opt/cursor-agent/versions/${LATEST}/cursor-agent" /usr/local/bin/cursor-agent \

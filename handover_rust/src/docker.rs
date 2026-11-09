@@ -393,7 +393,7 @@ fn cpu_percent(stats: &Stats) -> f64 {
         .system_cpu_usage
         .unwrap_or(0)
         .saturating_sub(precpu.system_cpu_usage.unwrap_or(0));
-    if cpu_delta <= 0 || system_delta <= 0 {
+    if cpu_delta == 0 || system_delta == 0 {
         return 0.0;
     }
     let online_cpus = cpu

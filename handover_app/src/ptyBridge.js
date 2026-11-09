@@ -90,6 +90,8 @@ export function pasteIntoTerminal(text, instanceId, { bracketed = true } = {}) {
   const state = getBridges().get(key)
   if (!state?.ws || state.ws.readyState !== WebSocket.OPEN) return
   const sanitized = text
+    // Strip ESC so pasted text can't inject terminal control sequences.
+    // eslint-disable-next-line no-control-regex
     .replace(/\x1b/g, '')
     .replace(/\r\n/g, '\r')
     .replace(/\n/g, '\r')

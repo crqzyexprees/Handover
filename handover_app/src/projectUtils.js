@@ -29,23 +29,6 @@ export function getProjectInstances(project) {
   return Array.isArray(raw) ? raw : []
 }
 
-export function instanceIsActiveWriter(instance) {
-  if (!instance || typeof instance !== 'object') return false
-  return Boolean(
-    instance.activeWriter ??
-      instance.isActiveWriter ??
-      instance.active_writer ??
-      instance.meta?.activeWriter,
-  )
-}
-
-const CLI_LABELS = {
-  claude: 'Claude',
-  codex: 'Codex',
-  gemini: 'Gemini',
-  cursor: 'Cursor',
-}
-
 export function getProjectConfig(project) {
   if (!project?.config || typeof project.config !== 'object') {
     return null
@@ -69,12 +52,4 @@ export function getProjectDisplayName(project) {
 export function getTerminalSidebarLabel(project, instance, index) {
   const mode = instance?.sandbox_mode === 'native' ? 'Native' : 'Docker'
   return `Terminal ${index + 1} (${mode})`
-}
-
-export function instanceDisplayLabel(instance) {
-  const raw = instance?.cliType ?? instance?.cli_type ?? instance?.type ?? ''
-  const key = String(raw).toLowerCase()
-  if (CLI_LABELS[key]) return CLI_LABELS[key]
-  if (!key) return 'CLI'
-  return key.charAt(0).toUpperCase() + key.slice(1)
 }

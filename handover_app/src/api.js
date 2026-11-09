@@ -26,11 +26,14 @@ async function request(fn) {
 
 /** Normalize handoff API responses (Rust may return status:error in HTTP 200 or 400). */
 export function parseHandoffResult(data) {
+  // `kind` is set by the backend: git_committed | git_no_changes |
+  // summary_written | summary_timed_out | not_git_repo
+  const kind = data?.kind ?? null
   if (data?.status === 'error') {
-    return { ok: false, message: data.message ?? 'Handoff failed' }
+    return { ok: false, kind, message: data.message ?? 'Handoff failed' }
   }
   if (data?.status === 'ok') {
-    return { ok: true, message: data.message ?? 'Handover complete' }
+    return { ok: true, kind, message: data.message ?? 'Handover complete' }
   }
   return { ok: false, message: 'Unexpected handoff response' }
 }
