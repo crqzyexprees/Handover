@@ -192,6 +192,66 @@ fn runnable_copy(bundled: &Path, data_dir: &Path) -> PathBuf {
     }
 }
 
+/// Environment changes that undo an AppImage's launcher: every variable
+/// that points into the mount (`PATH`, `LD_LIBRARY_PATH`, `PYTHONHOME`, ...)
+/// loses those entries, or is removed if nothing else is left. Without this
+/// the backend, and every native terminal it starts, would run the bundle's
+/// libraries and interpreters (and break once the mount is gone).
+fn scrub_appimage_env(
+    vars: impl IntoIterator<Item = (String, String)>,
+    appdir: &str,
+) -> Vec<(String, Option<String>)> {
+    let appdir = appdir.trim_end_matches('/');
+    let mut changes = Vec::new();
+    for (key, value) in vars {
+        if matches!(key.as_str(), "APPDIR" | "APPIMAGE" | "ARGV0") {
+            changes.push((key, None));
+            continue;
+        }
+        if appdir.is_empty() || !value.contains(appdir) {
+            continue;
+        }
+        let kept: Vec<&str> = value
+            .split(':')
+            .filter(|part| !part.is_empty() && !part.starts_with(appdir))
+            .collect();
+        let new = (!kept.is_empty()).then(|| kept.join(":"));
+        changes.push((key, new));
+    }
+    changes
+}
+
+/// In the forked child, just before exec: close every inherited descriptor
+/// above stderr on exec. The AppImage runtime stays alive while anyone holds
+/// its keep-alive pipe, so a backend that inherited it would keep a stale
+/// runtime (and mount) around for as long as it runs.
+#[cfg(target_os = "linux")]
+fn close_inherited_fds_in_child(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the hook only makes async-signal-safe syscalls (close_range /
+    // fcntl) and touches no memory.
+    unsafe {
+        cmd.pre_exec(|| {
+            let marked = libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            ) == 0;
+            if !marked {
+                // Kernels before 5.11: mark the usual range one by one.
+                for fd in 3..4096 {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags >= 0 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Starts a backend that isn't tied to this process, so it can outlive it.
 fn spawn_backend(data_dir: &Path, port: u16, token: &str) -> Result<u32> {
     let exe = runnable_copy(&bundled_backend()?, data_dir);
@@ -215,6 +275,20 @@ fn spawn_backend(data_dir: &Path, port: u16, token: &str) -> Result<u32> {
     .stdin(Stdio::null())
     .stdout(log.try_clone()?)
     .stderr(log);
+    // Not the app's folder, which may be inside the AppImage mount.
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        cmd.current_dir(home);
+    }
+    if let Ok(appdir) = std::env::var("APPDIR") {
+        for (key, value) in scrub_appimage_env(std::env::vars(), &appdir) {
+            match value {
+                Some(v) => cmd.env(key, v),
+                None => cmd.env_remove(key),
+            };
+        }
+    }
+    #[cfg(target_os = "linux")]
+    close_inherited_fds_in_child(&mut cmd);
     // Own process group: a Ctrl-C or hangup aimed at the app doesn't reach it.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -333,5 +407,37 @@ pub fn run() {
             eprintln!("failed to start Handover desktop: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scrub(vars: &[(&str, &str)]) -> Vec<(String, Option<String>)> {
+        scrub_appimage_env(
+            vars.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+            "/tmp/.mount_X",
+        )
+    }
+
+    #[test]
+    fn appimage_paths_are_removed_and_the_rest_kept() {
+        let changes = scrub(&[
+            ("PATH", "/tmp/.mount_X/usr/bin/:/usr/bin:/bin"),
+            ("PYTHONHOME", "/tmp/.mount_X/usr/"),
+            ("LD_LIBRARY_PATH", "/tmp/.mount_X/usr/lib/:"),
+            ("APPIMAGE", "/home/u/Handover.AppImage"),
+            ("HOME", "/home/u"),
+        ]);
+        assert_eq!(
+            changes,
+            [
+                ("PATH".into(), Some("/usr/bin:/bin".into())),
+                ("PYTHONHOME".into(), None),
+                ("LD_LIBRARY_PATH".into(), None),
+                ("APPIMAGE".into(), None),
+            ]
+        );
     }
 }
