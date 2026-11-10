@@ -1,12 +1,12 @@
 //! Desktop shell: finds or starts the `handover-backend` and hands its port
 //! and token to the UI.
 //!
-//! The backend outlives the window so running shells survive an app quit:
-//! on quit we ask it to stop only if no shell is running. Its port and token
-//! are kept in a private runtime file (`backend.json` in the app's local data
+//! The backend outlives the window so running shells and containers survive
+//! an app quit: on quit we ask it to stop only if nothing in it is busy.
+//! Its port and token are kept in a private runtime file (`backend.json` in the app's local data
 //! dir); the next launch reuses that backend, and its terminals re-attach.
 //! While the app is open it sends a heartbeat; a backend left behind exits
-//! by itself after `IDLE_EXIT_SECS` with no shells and no requests.
+//! by itself after `IDLE_EXIT_SECS` with nothing busy and no requests.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -98,6 +98,38 @@ fn http(
 struct Ping {
     version: String,
     shells: usize,
+    /// Instances stopping the backend would lose. Older backends don't
+    /// send it; their running shells are the closest measure.
+    #[serde(default)]
+    busy: Option<usize>,
+}
+
+impl Ping {
+    fn busy(&self) -> usize {
+        self.busy.unwrap_or(self.shells)
+    }
+}
+
+/// What to do with the backend a previous launch left behind.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    /// It is up and usable: connect to it.
+    Reuse,
+    /// It is an older build with nothing busy: stop it, then start ours.
+    ReplaceIdle,
+    /// Nothing usable is there: start a new one.
+    Spawn,
+}
+
+/// `ping` is the saved backend's answer, `None` if there was no saved
+/// backend or it didn't answer. A backend from another app version is
+/// still reused while it is busy, so its shells and containers aren't lost.
+fn plan_backend(ping: Option<&Ping>, app_version: &str) -> Plan {
+    match ping {
+        None => Plan::Spawn,
+        Some(p) if p.version == app_version || p.busy() > 0 => Plan::Reuse,
+        Some(_) => Plan::ReplaceIdle,
+    }
 }
 
 /// The backend's status, if it is up and accepts this token.
@@ -108,7 +140,7 @@ fn ping(port: u16, token: &str) -> Option<Ping> {
     }
 }
 
-/// Asks the backend to exit if no shell is running. True if it is stopping.
+/// Asks the backend to exit if nothing is busy. True if it is stopping.
 fn stop_if_idle(port: u16, token: &str) -> bool {
     #[derive(Deserialize)]
     struct Reply {
@@ -318,18 +350,17 @@ fn spawn_backend(data_dir: &Path, port: u16, token: &str) -> Result<u32> {
 /// its shells), otherwise starts a new one. Returns `(port, token)`.
 fn connect_backend(data_dir: &Path, info_path: &Path) -> Result<(u16, String)> {
     if let Some(info) = read_info(info_path) {
-        if let Some(status) = ping(info.port, &info.token) {
-            let outdated = status.version != APP_VERSION;
-            // An older build with nothing running is replaced; one with
-            // running shells is kept so they aren't lost.
-            if !outdated || status.shells > 0 {
-                return Ok((info.port, info.token));
+        let status = ping(info.port, &info.token);
+        match plan_backend(status.as_ref(), APP_VERSION) {
+            Plan::Reuse => return Ok((info.port, info.token)),
+            Plan::ReplaceIdle => {
+                if stop_if_idle(info.port, &info.token) {
+                    wait_until(Duration::from_secs(5), || {
+                        ping(info.port, &info.token).is_none()
+                    });
+                }
             }
-            if stop_if_idle(info.port, &info.token) {
-                wait_until(Duration::from_secs(5), || {
-                    ping(info.port, &info.token).is_none()
-                });
-            }
+            Plan::Spawn => {}
         }
     }
     let port = pick_free_port()?;
@@ -353,7 +384,7 @@ fn start_heartbeat(port: u16, token: String) {
     });
 }
 
-/// On quit: stop the backend unless shells are running in it.
+/// On quit: stop the backend unless something in it is busy.
 fn release_backend(state: &BackendState) {
     if stop_if_idle(state.port, &state.token) {
         let _ = std::fs::remove_file(&state.info_path);
@@ -413,6 +444,32 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pinged(version: &str, shells: usize, busy: Option<usize>) -> Ping {
+        Ping {
+            version: version.into(),
+            shells,
+            busy,
+        }
+    }
+
+    #[test]
+    fn backend_plan_table() {
+        let cases = [
+            (None, Plan::Spawn),
+            (Some(pinged(APP_VERSION, 0, Some(0))), Plan::Reuse),
+            (Some(pinged(APP_VERSION, 2, Some(2))), Plan::Reuse),
+            (Some(pinged("0.9.0", 0, Some(0))), Plan::ReplaceIdle),
+            // A container with no shell attached still counts as busy.
+            (Some(pinged("0.9.0", 0, Some(1))), Plan::Reuse),
+            // Older backends report only shells.
+            (Some(pinged("0.9.0", 1, None)), Plan::Reuse),
+            (Some(pinged("0.9.0", 0, None)), Plan::ReplaceIdle),
+        ];
+        for (ping, want) in cases {
+            assert_eq!(plan_backend(ping.as_ref(), APP_VERSION), want);
+        }
+    }
 
     fn scrub(vars: &[(&str, &str)]) -> Vec<(String, Option<String>)> {
         scrub_appimage_env(

@@ -58,7 +58,8 @@ struct Cli {
     host: String,
     #[arg(long, default_value_t = 8765)]
     port: u16,
-    /// Exit after this many seconds with no running shells and no requests.
+    /// Exit after this many seconds with no busy Instance (running shell or
+    /// container) and no requests.
     /// The desktop app sets it so a backend it leaves running (to keep
     /// shells alive across app restarts) doesn't outlive its usefulness.
     #[arg(long)]
@@ -196,6 +197,8 @@ async fn ping(State(ctx): State<ServerCtx>) -> Json<Value> {
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
         "shells": ctx.terminals.running().await,
+        // Instances that stopping the backend would lose; 0 means idle.
+        "busy": ctx.projects.busy_instances().await,
     }))
 }
 
@@ -209,12 +212,13 @@ fn default_true() -> bool {
     true
 }
 
-/// Stops the backend; with `only_if_idle`, only when no shell is running.
-/// The desktop app calls this on quit, so running shells survive the quit.
+/// Stops the backend; with `only_if_idle`, only when no Instance is busy
+/// (see `Projects::busy_instances`). The desktop app calls this on quit,
+/// so running shells and containers survive the quit.
 async fn shutdown(State(ctx): State<ServerCtx>, Json(body): Json<ShutdownBody>) -> Json<Value> {
-    let shells = ctx.terminals.running().await;
-    if body.only_if_idle && shells > 0 {
-        return Json(json!({ "stopping": false, "shells": shells }));
+    let busy = ctx.projects.busy_instances().await;
+    if body.only_if_idle && busy > 0 {
+        return Json(json!({ "stopping": false, "busy": busy }));
     }
     let signal = ctx.shutdown.clone();
     tokio::spawn(async move {
@@ -222,7 +226,7 @@ async fn shutdown(State(ctx): State<ServerCtx>, Json(body): Json<ShutdownBody>) 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         signal.notify_one();
     });
-    Json(json!({ "stopping": true, "shells": shells }))
+    Json(json!({ "stopping": true, "busy": busy }))
 }
 
 async fn track_activity(
@@ -832,15 +836,15 @@ async fn stop_requested(shutdown: &tokio::sync::Notify) {
 }
 
 fn spawn_idle_watchdog(ctx: &ServerCtx, idle_secs: u64) {
-    let terminals = ctx.terminals.clone();
+    let projects = ctx.projects.clone();
     let activity = ctx.activity.clone();
     let shutdown = ctx.shutdown.clone();
     tokio::spawn(async move {
         let check_every = std::time::Duration::from_secs(idle_secs.clamp(1, 30));
         loop {
             tokio::time::sleep(check_every).await;
-            if terminals.running().await == 0 && activity.idle_secs() >= idle_secs {
-                tracing::info!("no shells and no requests for {idle_secs}s; exiting");
+            if activity.idle_secs() >= idle_secs && projects.busy_instances().await == 0 {
+                tracing::info!("nothing busy and no requests for {idle_secs}s; exiting");
                 shutdown.notify_one();
                 return;
             }
@@ -1097,6 +1101,33 @@ mod tests {
             .map(|i| i["id"].as_str().unwrap())
             .collect();
         assert_eq!(listed, opened);
+    }
+
+    #[tokio::test]
+    async fn an_instance_with_a_container_keeps_the_backend_busy() {
+        let h = harness(FakeSandbox {
+            container: Some("c1".into()),
+            ..Default::default()
+        })
+        .await;
+        let pid = h.create_project().await;
+        let (_, inst) = h
+            .call("POST", "/api/instances/start", json!({ "project_id": pid }))
+            .await;
+        // No shell attached yet, but the container would be lost.
+        let (_, ping) = h.call("GET", "/api/ping", Value::Null).await;
+        assert_eq!(ping["shells"], 0);
+        assert_eq!(ping["busy"], 1);
+        let (_, reply) = h
+            .call("POST", "/api/shutdown", json!({ "only_if_idle": true }))
+            .await;
+        assert_eq!(reply["stopping"], false);
+
+        let iid = inst["id"].as_str().unwrap();
+        h.call("DELETE", &format!("/api/instances/{iid}"), Value::Null)
+            .await;
+        let (_, ping) = h.call("GET", "/api/ping", Value::Null).await;
+        assert_eq!(ping["busy"], 0);
     }
 
     #[tokio::test]

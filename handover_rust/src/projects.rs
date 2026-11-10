@@ -211,6 +211,26 @@ impl Projects {
         !self.inner.read().await.instances.is_empty()
     }
 
+    /// How many Instances still hold work that stopping the backend would
+    /// lose: a running shell, or a container (torn down on exit). The
+    /// backend counts as idle exactly when this is 0.
+    pub async fn busy_instances(&self) -> usize {
+        let instances: Vec<(String, bool)> = self
+            .inner
+            .read()
+            .await
+            .instances
+            .values()
+            .map(|i| (i.id.clone(), i.container_id.is_some()))
+            .collect();
+        let ids: Vec<&str> = instances.iter().map(|(id, _)| id.as_str()).collect();
+        let shells = self.terminals.running_shells(&ids).await;
+        instances
+            .iter()
+            .filter(|(id, has_container)| *has_container || shells.contains_key(id))
+            .count()
+    }
+
     /// The saved config with the project folder's `config.yml` on top.
     pub async fn effective_config(&self, project_id: &str) -> ProjectResult<ProjectConfig> {
         let (project, stored) = {
