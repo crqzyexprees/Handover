@@ -72,21 +72,15 @@ export async function unloadProject(id) {
   })
 }
 
-export async function startInstance(
-  projectId,
-  sandboxMode = 'docker',
-  memLimit = '2g',
-  customEnvVars = null,
-) {
+/**
+ * Opens a terminal. The backend applies the project's effective config
+ * (including `.handover/config.yml`); pass `sandboxMode` only for an explicit
+ * Native/Docker choice.
+ */
+export async function startInstance(projectId, sandboxMode) {
   return request(async () => {
-    const body = {
-      project_id: projectId,
-      sandbox_mode: sandboxMode,
-      mem_limit: memLimit,
-    }
-    if (customEnvVars != null && Object.keys(customEnvVars).length > 0) {
-      body.custom_env_vars = customEnvVars
-    }
+    const body = { project_id: projectId }
+    if (sandboxMode) body.sandbox_mode = sandboxMode
     const res = await client.post('/api/instances/start', body)
     return res.data
   })

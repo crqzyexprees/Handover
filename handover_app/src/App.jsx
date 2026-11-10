@@ -180,42 +180,12 @@ export default function App() {
     return instances
   }, [projects])
 
-  const startInstanceForProject = useCallback(async (
-    projectId,
-    sandboxMode,
-    memLimit,
-    customEnvVars,
-  ) => {
+  const startInstanceForProject = useCallback(async (projectId, sandboxMode) => {
     if (projectId == null) {
       pushToast('Select a project before opening a terminal', 'warn')
       return null
     }
-    const project = projects.find(
-      (p) => String(getProjectId(p) ?? '') === String(projectId),
-    )
-    const savedConfig =
-      project?.config && typeof project.config === 'object'
-        ? project.config
-        : DEFAULT_PROJECT_CONFIG
-    const resolvedSandboxMode =
-      sandboxMode ??
-      savedConfig.sandbox_mode ??
-      project?.sandbox_mode ??
-      DEFAULT_PROJECT_CONFIG.sandbox_mode
-    const resolvedMemLimit =
-      memLimit ?? savedConfig.mem_limit ?? DEFAULT_PROJECT_CONFIG.mem_limit
-    const resolvedCustomEnvVars =
-      customEnvVars ??
-      (savedConfig.custom_env_vars && typeof savedConfig.custom_env_vars === 'object'
-        ? savedConfig.custom_env_vars
-        : DEFAULT_PROJECT_CONFIG.custom_env_vars)
-
-    const { data, error } = await api.startInstance(
-      projectId,
-      resolvedSandboxMode,
-      resolvedMemLimit,
-      resolvedCustomEnvVars,
-    )
+    const { data, error } = await api.startInstance(projectId, sandboxMode)
     if (error) {
       pushToast(`Could not start terminal: ${formatApiError(error)}`, 'error')
       return null
@@ -256,32 +226,11 @@ export default function App() {
 
     setFocusedInstanceId(normalizedId)
     return normalizedId
-  }, [projects, pushToast])
+  }, [pushToast])
 
   const handleStartInstance = useCallback(
-    async (sandboxMode) => {
-      const project = projects.find(
-        (p) => String(getProjectId(p) ?? '') === String(focusedProjectId ?? ''),
-      )
-      const savedConfig =
-        project?.config && typeof project.config === 'object'
-          ? project.config
-          : DEFAULT_PROJECT_CONFIG
-      const resolvedSandboxMode =
-        sandboxMode ?? savedConfig?.sandbox_mode ?? DEFAULT_PROJECT_CONFIG.sandbox_mode
-      const resolvedMemLimit =
-        savedConfig?.mem_limit ?? DEFAULT_PROJECT_CONFIG.mem_limit
-      const resolvedCustomEnvVars =
-        savedConfig?.custom_env_vars ?? DEFAULT_PROJECT_CONFIG.custom_env_vars
-
-      return startInstanceForProject(
-        focusedProjectId,
-        resolvedSandboxMode,
-        resolvedMemLimit,
-        resolvedCustomEnvVars,
-      )
-    },
-    [focusedProjectId, projects, startInstanceForProject],
+    (sandboxMode) => startInstanceForProject(focusedProjectId, sandboxMode),
+    [focusedProjectId, startInstanceForProject],
   )
 
   const handleSelectProject = useCallback(async (id) => {
@@ -315,16 +264,7 @@ export default function App() {
     const shouldAutoStart =
       instances.length === 0 && localInstancesBeforeSelect.length === 0
     if (shouldAutoStart) {
-      const cfg =
-        selectedProject?.config && typeof selectedProject.config === 'object'
-          ? selectedProject.config
-          : DEFAULT_PROJECT_CONFIG
-      await startInstanceForProject(
-        projectId,
-        cfg.sandbox_mode ?? selectedProject?.sandbox_mode,
-        cfg.mem_limit,
-        cfg.custom_env_vars ?? DEFAULT_PROJECT_CONFIG.custom_env_vars,
-      )
+      await startInstanceForProject(projectId)
     } else {
       const sourceInstances =
         instances.length > 0 ? instances : localInstancesBeforeSelect

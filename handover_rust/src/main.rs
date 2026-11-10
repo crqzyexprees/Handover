@@ -168,12 +168,13 @@ struct ProjectConfigBody {
     custom_env_vars: Option<BTreeMap<String, String>>,
 }
 
+/// Everything else (memory limit, env vars, default mode) comes from the
+/// Project's effective config, so `.handover/config.yml` edits apply.
 #[derive(Deserialize)]
 struct InstanceStart {
     project_id: String,
+    /// An explicit choice (the Native / Docker button) over the config's mode.
     sandbox_mode: Option<String>,
-    mem_limit: Option<String>,
-    custom_env_vars: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -273,7 +274,14 @@ async fn list_projects(State(ctx): State<ServerCtx>) -> Json<Vec<Value>> {
     let projects: Vec<Project> = ctx.state.projects.read().await.values().cloned().collect();
     let mut out = Vec::with_capacity(projects.len());
     for p in projects {
-        let config = ctx.state.stored_config(&p).await;
+        let stored = ctx.state.stored_config(&p).await;
+        let config = match local_config::effective_config(&p.path, stored.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("ignoring unreadable config.yml for {}: {e:#}", p.path);
+                stored
+            }
+        };
         let mut view = project_view(&p, &config);
         view["instances"] = json!(ctx.state.instances_of(&p.id).await);
         out.push(view);
@@ -468,14 +476,14 @@ async fn start_instance(
     Json(body): Json<InstanceStart>,
 ) -> Result<Json<Instance>, Response> {
     let project = require_project(&ctx, &body.project_id).await?;
-    let sandbox_mode: SandboxMode =
-        parse_choice_or_default("sandbox_mode", body.sandbox_mode.as_deref())?;
+    let config = effective_config(&ctx, &project).await?;
+    let sandbox_mode: SandboxMode = match body.sandbox_mode.as_deref() {
+        Some(choice) => parse_choice("sandbox_mode", choice)?,
+        None => config.sandbox_mode,
+    };
     let id = Uuid::new_v4().to_string();
-    let mem_limit = body
-        .mem_limit
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MEM_LIMIT.into());
-    let custom_env_vars = body.custom_env_vars.unwrap_or_default();
+    let mem_limit = config.mem_limit;
+    let custom_env_vars = config.custom_env_vars;
 
     let container_id = ctx
         .sandboxes
@@ -1090,12 +1098,12 @@ mod tests {
             .call(
                 "POST",
                 "/api/instances/start",
-                json!({ "project_id": pid, "sandbox_mode": "docker", "mem_limit": "1g" }),
+                json!({ "project_id": pid, "sandbox_mode": "docker" }),
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{inst}");
         assert_eq!(inst["container_id"], "c1");
-        assert_eq!(inst["mem_limit"], "1g");
+        assert_eq!(inst["mem_limit"], "2g");
         let iid = inst["id"].as_str().unwrap();
 
         let (_, stats) = h
@@ -1114,6 +1122,44 @@ mod tests {
                 format!("teardown {iid}")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn hand_edited_config_yml_drives_new_instances() {
+        let h = harness(FakeSandbox {
+            container: Some("c1".into()),
+            ..Default::default()
+        });
+        let pid = h.create_project().await;
+        std::fs::write(
+            h.project_dir.join(".handover/config.yml"),
+            "sandbox_mode: docker\nmem_limit: 3g\ncustom_env_vars:\n  FOO: bar\n",
+        )
+        .unwrap();
+        let (status, inst) = h
+            .call("POST", "/api/instances/start", json!({ "project_id": pid }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{inst}");
+        assert_eq!(inst["sandbox_mode"], "docker");
+        assert_eq!(inst["mem_limit"], "3g");
+        assert_eq!(inst["custom_env_vars"]["FOO"], "bar");
+        let (_, list) = h.call("GET", "/api/projects", Value::Null).await;
+        assert_eq!(list[0]["config"]["mem_limit"], "3g");
+    }
+
+    #[tokio::test]
+    async fn explicit_mode_choice_overrides_the_config() {
+        let h = harness(FakeSandbox::default());
+        let pid = h.create_project().await; // config says docker
+        let (_, inst) = h
+            .call(
+                "POST",
+                "/api/instances/start",
+                json!({ "project_id": pid, "sandbox_mode": "native" }),
+            )
+            .await;
+        assert_eq!(inst["sandbox_mode"], "native");
+        assert!(h.docker.calls().is_empty());
     }
 
     #[tokio::test]
