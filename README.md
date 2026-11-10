@@ -130,9 +130,8 @@ Output: `handover_app/src-tauri/target/release/bundle/`
 Build release packages on the target OS:
 
 - Linux: build on Linux for AppImage output.
-- macOS: build on macOS for `.app`/`.dmg` output. The generated `icon.icns`
-  is currently a placeholder and should be replaced with a real macOS `.icns`
-  before public distribution.
+- macOS: build on macOS for `.app`/`.dmg` output. `npm run icons` generates
+  a full `icon.icns` (16–1024px, 1x and @2x) from `icon-source.png`.
 - Windows: build on Windows with the Rust MSVC toolchain and Visual Studio
   Build Tools installed. See [`WINDOWS_BUILD.md`](WINDOWS_BUILD.md) for the full guide.
 
