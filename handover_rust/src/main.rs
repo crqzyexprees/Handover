@@ -1,13 +1,19 @@
+// Handlers return `Result<_, Response>` (axum's idiom); the large Err is fine.
+#![allow(clippy::result_large_err)]
+
 mod auth;
 mod docker;
 mod governor;
 mod handoff;
+mod handoff_flow;
 mod local_config;
+mod model;
 mod process_stats;
 mod pty;
+mod sandbox;
 mod state;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -17,6 +23,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
@@ -25,11 +32,13 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 use crate::docker::DockerRuntime;
-use crate::state::{
-    basename_from_path, default_project_config, monotonic_secs, project_container_ids, AppState,
-    DEFAULT_MEM_LIMIT, HANDOFF_METHODS, HANDOFF_TEMPLATES, RAM_EMERGENCY_THRESHOLD,
-    RAM_SUSPEND_THRESHOLD, SANDBOX_MODES,
+use crate::handoff_flow::{HandoffFailure, HandoffPlan, PromptSink};
+use crate::model::{
+    basename_from_path, HandoffMethod, Instance, Project, ProjectConfig, ProjectState, SandboxMode,
+    DEFAULT_MEM_LIMIT,
 };
+use crate::sandbox::{DockerSandbox, NativeSandbox, ProvisionRequest, SandboxError, Sandboxes};
+use crate::state::{monotonic_secs, AppState, RAM_EMERGENCY_THRESHOLD, RAM_SUSPEND_THRESHOLD};
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -53,10 +62,19 @@ struct Cli {
 struct ServerCtx {
     state: Arc<AppState>,
     docker: Arc<RwLock<Option<Arc<DockerRuntime>>>>,
+    sandboxes: Sandboxes,
 }
 
 fn api_err(status: StatusCode, detail: impl Into<String>) -> Response {
     (status, Json(json!({ "detail": detail.into() }))).into_response()
+}
+
+fn sandbox_err(e: SandboxError) -> Response {
+    let status = match e {
+        SandboxError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        SandboxError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    api_err(status, e.to_string())
 }
 
 async fn persist_or_500(state: &AppState) -> Result<(), Response> {
@@ -94,73 +112,61 @@ fn validate_project_path(path: &str) -> Result<String, Response> {
         .ok_or_else(|| api_err(StatusCode::BAD_REQUEST, "Project path is not valid UTF-8"))
 }
 
-async fn get_docker(ctx: &ServerCtx) -> Result<Arc<DockerRuntime>, Response> {
-    if let Some(runtime) = ctx.docker.read().await.clone() {
-        return Ok(runtime);
-    }
-
-    let mut slot = ctx.docker.write().await;
-    if let Some(runtime) = slot.clone() {
-        return Ok(runtime);
-    }
-
-    let runtime = Arc::new(DockerRuntime::new().map_err(|e| {
-        api_err(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Docker is not available: {e}"),
-        )
-    })?);
-    *slot = Some(runtime.clone());
-    Ok(runtime)
+/// Parses one of an enum's wire names, e.g. `"native"`, into the enum.
+fn parse_choice<T: DeserializeOwned>(field: &str, value: &str) -> Result<T, Response> {
+    serde_json::from_value(Value::String(value.into()))
+        .map_err(|e| api_err(StatusCode::BAD_REQUEST, format!("{field}: {e}")))
 }
 
-fn sandbox_ok(mode: &str) -> bool {
-    SANDBOX_MODES.contains(&mode)
+fn parse_choice_or_default<T: DeserializeOwned + Default>(
+    field: &str,
+    value: Option<&str>,
+) -> Result<T, Response> {
+    value.map_or_else(|| Ok(T::default()), |v| parse_choice(field, v))
+}
+
+async fn require_project(ctx: &ServerCtx, project_id: &str) -> Result<Project, Response> {
+    ctx.state
+        .project(project_id)
+        .await
+        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "Project not found"))
+}
+
+/// A project as the frontend sees it: its record plus its config and display name.
+fn project_view(project: &Project, config: &ProjectConfig) -> Value {
+    let name = [config.project_name.as_str(), project.name.as_str()]
+        .into_iter()
+        .find(|s| !s.trim().is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| basename_from_path(&project.path));
+    let mut view = json!(project);
+    view["name"] = json!(name);
+    view["config"] = json!(config);
+    view
 }
 
 #[derive(Deserialize)]
 struct ProjectCreate {
     path: String,
-    #[serde(default = "default_docker")]
-    sandbox_mode: String,
-}
-
-fn default_docker() -> String {
-    "docker".into()
+    sandbox_mode: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ProjectConfigBody {
     project_name: Option<String>,
-    #[serde(default = "default_docker")]
-    sandbox_mode: String,
-    #[serde(default = "default_mem")]
-    mem_limit: String,
-    #[serde(default = "default_handoff_method")]
-    handoff_method: String,
-    #[serde(default = "default_handoff_template")]
-    handoff_template: String,
-    custom_env_vars: Option<HashMap<String, String>>,
-}
-
-fn default_handoff_template() -> String {
-    "generic".into()
-}
-
-fn default_mem() -> String {
-    DEFAULT_MEM_LIMIT.into()
-}
-fn default_handoff_method() -> String {
-    "summary".into()
+    sandbox_mode: Option<String>,
+    mem_limit: Option<String>,
+    handoff_method: Option<String>,
+    handoff_template: Option<String>,
+    custom_env_vars: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
 struct InstanceStart {
     project_id: String,
-    #[serde(default = "default_docker")]
-    sandbox_mode: String,
+    sandbox_mode: Option<String>,
     mem_limit: Option<String>,
-    custom_env_vars: Option<HashMap<String, String>>,
+    custom_env_vars: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -207,236 +213,151 @@ async fn update_config(State(ctx): State<ServerCtx>, Json(body): Json<Value>) ->
 async fn list_projects(State(ctx): State<ServerCtx>) -> Json<Vec<Value>> {
     let projects = ctx.state.projects.read().await;
     let configs = ctx.state.project_configs.read().await;
-    let mut result = Vec::new();
-    for (id, project) in projects.iter() {
-        let mut entry = project.clone();
-        if let Some(cfg) = configs.get(id) {
-            if let Some(obj) = entry.as_object_mut() {
-                obj.insert("config".into(), cfg.clone());
-                let name = cfg
-                    .get("project_name")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from)
-                    .or_else(|| obj.get("name").and_then(|v| v.as_str()).map(String::from))
-                    .unwrap_or_else(|| {
-                        obj.get("path")
-                            .and_then(|v| v.as_str())
-                            .map(basename_from_path)
-                            .unwrap_or_else(|| "Unknown".into())
-                    });
-                obj.insert("name".into(), json!(name));
-            }
-        } else if entry.get("name").is_none() {
-            if let Some(obj) = entry.as_object_mut() {
-                let name = obj
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .map(basename_from_path)
-                    .unwrap_or_else(|| "Unknown".into());
-                obj.insert("name".into(), json!(name));
-            }
-        }
-        result.push(entry);
-    }
-    Json(result)
+    Json(
+        projects
+            .values()
+            .map(|p| {
+                let config = configs
+                    .get(&p.id)
+                    .cloned()
+                    .unwrap_or_else(|| ProjectConfig::defaults_for(&p.path));
+                project_view(p, &config)
+            })
+            .collect(),
+    )
 }
 
 async fn create_project(
     State(ctx): State<ServerCtx>,
     Json(body): Json<ProjectCreate>,
 ) -> Result<Json<Value>, Response> {
-    if !sandbox_ok(&body.sandbox_mode) {
-        return Err(api_err(
-            StatusCode::BAD_REQUEST,
-            format!("sandbox_mode must be one of {SANDBOX_MODES:?}"),
-        ));
-    }
-    let project_path = validate_project_path(&body.path)?;
-    let project_id = Uuid::new_v4().to_string();
-    let name = basename_from_path(&project_path);
-    let project = json!({
-        "id": project_id,
-        "path": project_path,
-        "name": name,
-        "sandbox_mode": body.sandbox_mode,
-        "state": "active",
-    });
-    let mut config = default_project_config(&project_path);
-    if let Some(obj) = config.as_object_mut() {
-        obj.insert("sandbox_mode".into(), json!(body.sandbox_mode));
-    }
+    let sandbox_mode: SandboxMode =
+        parse_choice_or_default("sandbox_mode", body.sandbox_mode.as_deref())?;
+    let path = validate_project_path(&body.path)?;
+    let project = Project {
+        id: Uuid::new_v4().to_string(),
+        name: basename_from_path(&path),
+        path,
+        sandbox_mode,
+        state: ProjectState::Active,
+    };
+    let mut config = ProjectConfig::defaults_for(&project.path);
+    config.sandbox_mode = sandbox_mode;
+
     ctx.state
         .projects
         .write()
         .await
-        .insert(project_id.clone(), project.clone());
+        .insert(project.id.clone(), project.clone());
     ctx.state
         .project_configs
         .write()
         .await
-        .insert(project_id.clone(), config.clone());
+        .insert(project.id.clone(), config.clone());
     ctx.state
         .project_last_active
         .write()
         .await
-        .insert(project_id, monotonic_secs());
-    if let Err(e) = local_config::write_local_config(&project_path, &config).await {
+        .insert(project.id.clone(), monotonic_secs());
+    if let Err(e) = local_config::write_local_config(&project.path, &config).await {
         warn!("failed to write .handover/config.yml on create: {e}");
     }
     persist_or_500(&ctx.state).await?;
-
-    let mut out = project;
-    if let Some(obj) = out.as_object_mut() {
-        obj.insert("config".into(), config);
-    }
-    Ok(Json(out))
+    Ok(Json(project_view(&project, &config)))
 }
 
-async fn merged_project_config(
-    ctx: &ServerCtx,
-    project_id: &str,
-    path: &str,
-) -> Result<Value, Response> {
-    let mut configs = ctx.state.project_configs.write().await;
-    if !configs.contains_key(project_id) {
-        configs.insert(project_id.to_string(), default_project_config(path));
-    }
-    let persisted = configs[project_id].clone();
-    drop(configs);
-
-    let base = default_project_config(path);
-    let file_config = local_config::read_local_config(path)
+/// The project's config in effect (saved settings, overridden by its config.yml).
+async fn effective_config(ctx: &ServerCtx, project: &Project) -> Result<ProjectConfig, Response> {
+    let stored = ctx.state.stored_config(project).await;
+    local_config::effective_config(&project.path, stored)
         .await
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    // Precedence (later wins): defaults < app-persisted < .handover/config.yml.
-    // Saving from the UI writes both, so they agree; a hand edit to the
-    // file must win over the stale persisted copy.
-    let mut merged = local_config::merge_config_values(base, persisted);
-    if let Some(file) = file_config {
-        merged = local_config::merge_config_values(merged, file);
-    }
-    Ok(merged)
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
 }
 
 async fn get_project_config(
     State(ctx): State<ServerCtx>,
     Path(project_id): Path<String>,
-) -> Result<Json<Value>, Response> {
-    if !ctx.state.projects.read().await.contains_key(&project_id) {
-        return Err(api_err(StatusCode::NOT_FOUND, "Project not found"));
-    }
-    let path = ctx
-        .state
-        .projects
-        .read()
-        .await
-        .get(&project_id)
-        .and_then(|p| p.get("path").and_then(|v| v.as_str()).map(String::from))
-        .unwrap_or_default();
-
-    Ok(Json(merged_project_config(&ctx, &project_id, &path).await?))
+) -> Result<Json<ProjectConfig>, Response> {
+    let project = require_project(&ctx, &project_id).await?;
+    Ok(Json(effective_config(&ctx, &project).await?))
 }
 
 async fn save_project_config(
     State(ctx): State<ServerCtx>,
     Path(project_id): Path<String>,
     Json(body): Json<ProjectConfigBody>,
-) -> Result<Json<Value>, Response> {
-    let projects = ctx.state.projects.read().await;
-    let project = projects
-        .get(&project_id)
-        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "Project not found"))?;
-    let path = project
-        .get("path")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_default();
-    drop(projects);
-
-    if !sandbox_ok(&body.sandbox_mode) {
-        return Err(api_err(
-            StatusCode::BAD_REQUEST,
-            format!("sandbox_mode must be one of {SANDBOX_MODES:?}"),
-        ));
-    }
-    if !HANDOFF_METHODS.contains(&body.handoff_method.as_str()) {
-        return Err(api_err(
-            StatusCode::BAD_REQUEST,
-            format!("handoff_method must be one of {HANDOFF_METHODS:?}"),
-        ));
-    }
-    if !HANDOFF_TEMPLATES.contains(&body.handoff_template.as_str()) {
-        return Err(api_err(
-            StatusCode::BAD_REQUEST,
-            format!("handoff_template must be one of {HANDOFF_TEMPLATES:?}"),
-        ));
-    }
-
-    let display_name = body
-        .project_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| basename_from_path(&path));
-
-    let saved = json!({
-        "project_name": display_name,
-        "sandbox_mode": body.sandbox_mode,
-        "mem_limit": body.mem_limit,
-        "handoff_method": body.handoff_method,
-        "handoff_template": body.handoff_template,
-        "custom_env_vars": body.custom_env_vars.unwrap_or_default(),
-    });
+) -> Result<Json<ProjectConfig>, Response> {
+    let project = require_project(&ctx, &project_id).await?;
+    let config = ProjectConfig {
+        project_name: body
+            .project_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| basename_from_path(&project.path)),
+        sandbox_mode: parse_choice_or_default("sandbox_mode", body.sandbox_mode.as_deref())?,
+        mem_limit: body
+            .mem_limit
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MEM_LIMIT.into()),
+        handoff_method: parse_choice_or_default("handoff_method", body.handoff_method.as_deref())?,
+        handoff_template: parse_choice_or_default(
+            "handoff_template",
+            body.handoff_template.as_deref(),
+        )?,
+        custom_env_vars: body.custom_env_vars.unwrap_or_default(),
+    };
 
     ctx.state
         .project_configs
         .write()
         .await
-        .insert(project_id.clone(), saved.clone());
+        .insert(project_id.clone(), config.clone());
     if let Some(p) = ctx.state.projects.write().await.get_mut(&project_id) {
-        if let Some(obj) = p.as_object_mut() {
-            obj.insert("name".into(), json!(display_name));
-        }
+        p.name = config.project_name.clone();
     }
-    local_config::write_local_config(&path, &saved)
+    local_config::write_local_config(&project.path, &config)
         .await
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     persist_or_500(&ctx.state).await?;
-    Ok(Json(saved))
+    Ok(Json(config))
+}
+
+/// Unfreezes every instance of a project and marks it active.
+async fn resume_instances(ctx: &ServerCtx, project_id: &str) -> Result<(), SandboxError> {
+    for instance in ctx.state.instances_of(project_id).await {
+        ctx.sandboxes
+            .for_instance(&instance)
+            .resume(&instance)
+            .await?;
+    }
+    if let Some(p) = ctx.state.projects.write().await.get_mut(project_id) {
+        p.state = ProjectState::Active;
+    }
+    Ok(())
+}
+
+async fn touch_project(ctx: &ServerCtx, project_id: String) {
+    ctx.state
+        .project_last_active
+        .write()
+        .await
+        .insert(project_id, monotonic_secs());
 }
 
 async fn activate_project(
     State(ctx): State<ServerCtx>,
     Path(project_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
-    let mut projects = ctx.state.projects.write().await;
-    let project = projects
-        .get_mut(&project_id)
-        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "Project not found"))?;
-
-    if project.get("state").and_then(|v| v.as_str()) == Some("suspended") {
-        if let Ok(docker) = get_docker(&ctx).await {
-            let ids = project_container_ids(&ctx.state, &project_id).await;
-            for id in ids {
-                if let Err(e) = docker.resume_container(&id).await {
-                    warn!("failed to resume container while activating project: {e}");
-                }
-            }
-        }
-        if let Some(obj) = project.as_object_mut() {
-            obj.insert("state".into(), json!("active"));
+    let project = require_project(&ctx, &project_id).await?;
+    if project.state == ProjectState::Suspended {
+        if let Err(e) = resume_instances(&ctx, &project_id).await {
+            warn!("failed to resume instances while activating project: {e}");
         }
     }
-    drop(projects);
-
     *ctx.state.focused_project_id.write().await = Some(project_id.clone());
-    ctx.state
-        .project_last_active
-        .write()
-        .await
-        .insert(project_id, monotonic_secs());
+    touch_project(&ctx, project_id).await;
     persist_or_500(&ctx.state).await?;
     Ok(Json(json!({ "status": "ok" })))
 }
@@ -445,27 +366,11 @@ async fn resume_project(
     State(ctx): State<ServerCtx>,
     Path(project_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
-    if !ctx.state.projects.read().await.contains_key(&project_id) {
-        return Err(api_err(StatusCode::NOT_FOUND, "Project not found"));
-    }
-    let docker = get_docker(&ctx).await?;
-    let ids = project_container_ids(&ctx.state, &project_id).await;
-    for id in ids {
-        docker
-            .resume_container(&id)
-            .await
-            .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    }
-    if let Some(p) = ctx.state.projects.write().await.get_mut(&project_id) {
-        if let Some(obj) = p.as_object_mut() {
-            obj.insert("state".into(), json!("active"));
-        }
-    }
-    ctx.state
-        .project_last_active
-        .write()
+    require_project(&ctx, &project_id).await?;
+    resume_instances(&ctx, &project_id)
         .await
-        .insert(project_id, monotonic_secs());
+        .map_err(sandbox_err)?;
+    touch_project(&ctx, project_id).await;
     persist_or_500(&ctx.state).await?;
     Ok(Json(json!({ "status": "ok", "state": "active" })))
 }
@@ -474,25 +379,9 @@ async fn unload_project(
     State(ctx): State<ServerCtx>,
     Path(project_id): Path<String>,
 ) -> Json<Value> {
-    if !ctx.state.projects.read().await.contains_key(&project_id) {
+    if ctx.state.project(&project_id).await.is_none() {
         return Json(json!({ "status": "ok", "message": "Already unloaded" }));
     }
-
-    let instance_ids: Vec<String> = ctx
-        .state
-        .instances
-        .read()
-        .await
-        .iter()
-        .filter_map(|(id, inst)| {
-            if inst.get("project_id").and_then(|v| v.as_str()) == Some(project_id.as_str()) {
-                Some(id.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
     ctx.state.project_configs.write().await.remove(&project_id);
     ctx.state
         .project_last_active
@@ -500,18 +389,16 @@ async fn unload_project(
         .await
         .remove(&project_id);
 
-    let docker = ctx.docker.read().await.clone();
-    for instance_id in instance_ids {
-        let instance = ctx.state.instances.write().await.remove(&instance_id);
-        crate::pty::shutdown_instance_pty(&ctx.state, &instance_id).await;
-        if let Some(inst) = instance {
-            if let Some(cid) = inst.get("container_id").and_then(|v| v.as_str()) {
-                if let Some(d) = docker.as_ref() {
-                    if let Err(e) = d.stop_container(cid).await {
-                        warn!("failed to stop container while unloading project: {e}");
-                    }
-                }
-            }
+    for instance in ctx.state.instances_of(&project_id).await {
+        ctx.state.instances.write().await.remove(&instance.id);
+        pty::shutdown_instance_pty(&ctx.state, &instance.id).await;
+        if let Err(e) = ctx
+            .sandboxes
+            .for_instance(&instance)
+            .teardown(&instance)
+            .await
+        {
+            warn!("failed to tear down instance while unloading project: {e}");
         }
     }
 
@@ -525,62 +412,43 @@ async fn unload_project(
 async fn start_instance(
     State(ctx): State<ServerCtx>,
     Json(body): Json<InstanceStart>,
-) -> Result<Json<Value>, Response> {
-    let project = ctx
-        .state
-        .projects
-        .read()
+) -> Result<Json<Instance>, Response> {
+    let project = require_project(&ctx, &body.project_id).await?;
+    let sandbox_mode: SandboxMode =
+        parse_choice_or_default("sandbox_mode", body.sandbox_mode.as_deref())?;
+    let id = Uuid::new_v4().to_string();
+    let mem_limit = body
+        .mem_limit
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MEM_LIMIT.into());
+    let custom_env_vars = body.custom_env_vars.unwrap_or_default();
+
+    let container_id = ctx
+        .sandboxes
+        .for_mode(sandbox_mode)
+        .provision(ProvisionRequest {
+            instance_id: &id,
+            project_path: &project.path,
+            mem_limit: &mem_limit,
+            custom_env_vars: &custom_env_vars,
+        })
         .await
-        .get(&body.project_id)
-        .cloned()
-        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "Project not found"))?;
+        .map_err(sandbox_err)?;
 
-    if !sandbox_ok(&body.sandbox_mode) {
-        return Err(api_err(
-            StatusCode::BAD_REQUEST,
-            format!("sandbox_mode must be one of {SANDBOX_MODES:?}"),
-        ));
-    }
-
-    let instance_id = Uuid::new_v4().to_string();
-    let mut instance = json!({
-        "id": instance_id,
-        "project_id": body.project_id,
-        "sandbox_mode": body.sandbox_mode,
-    });
-
-    if body.sandbox_mode == "native" {
-        if let Some(obj) = instance.as_object_mut() {
-            obj.insert("container_id".into(), Value::Null);
-            // Applied to the native shell when its PTY is spawned (pty.rs).
-            // Kept in memory only; instances are never persisted.
-            obj.insert(
-                "custom_env_vars".into(),
-                json!(body.custom_env_vars.clone().unwrap_or_default()),
-            );
-        }
-    } else {
-        let docker = get_docker(&ctx).await?;
-        let path = project
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| api_err(StatusCode::INTERNAL_SERVER_ERROR, "project path missing"))?;
-        let mem_limit = body.mem_limit.as_deref().unwrap_or(DEFAULT_MEM_LIMIT);
-        let container_id = docker
-            .start_container(path, &instance_id, mem_limit, body.custom_env_vars.as_ref())
-            .await
-            .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        if let Some(obj) = instance.as_object_mut() {
-            obj.insert("container_id".into(), json!(container_id));
-            obj.insert("mem_limit".into(), json!(mem_limit));
-        }
-    }
-
+    let instance = Instance {
+        id,
+        project_id: project.id,
+        sandbox_mode,
+        // Only a container enforces the limit; don't report one otherwise.
+        mem_limit: container_id.as_ref().map(|_| mem_limit),
+        container_id,
+        custom_env_vars,
+    };
     ctx.state
         .instances
         .write()
         .await
-        .insert(instance_id.clone(), instance.clone());
+        .insert(instance.id.clone(), instance.clone());
     Ok(Json(instance))
 }
 
@@ -588,24 +456,26 @@ async fn delete_instance(
     State(ctx): State<ServerCtx>,
     Path(instance_id): Path<String>,
 ) -> Json<Value> {
-    let instance = ctx.state.instances.write().await.remove(&instance_id);
-    if instance.is_none() {
+    let Some(instance) = ctx.state.instances.write().await.remove(&instance_id) else {
         return Json(json!({ "status": "ok" }));
-    }
-    crate::pty::shutdown_instance_pty(&ctx.state, &instance_id).await;
-    if let Some(inst) = instance {
-        if let Some(cid) = inst.get("container_id").and_then(|v| v.as_str()) {
-            if let Some(docker) = ctx.docker.read().await.clone() {
-                let cid = cid.to_string();
-                tokio::spawn(async move {
-                    if let Err(e) = docker.stop_container(&cid).await {
-                        warn!("failed to stop deleted instance container: {e}");
-                    }
-                });
-            }
+    };
+    pty::shutdown_instance_pty(&ctx.state, &instance_id).await;
+    let sandboxes = ctx.sandboxes.clone();
+    tokio::spawn(async move {
+        if let Err(e) = sandboxes.for_instance(&instance).teardown(&instance).await {
+            warn!("failed to tear down deleted instance: {e}");
         }
-    }
+    });
     Json(json!({ "status": "ok" }))
+}
+
+async fn shell_pid(state: &AppState, instance_id: &str) -> Option<u32> {
+    state
+        .pty_sessions
+        .read()
+        .await
+        .get(instance_id)
+        .and_then(|s| s.shell_pid)
 }
 
 async fn instance_stats(
@@ -614,243 +484,96 @@ async fn instance_stats(
 ) -> Result<Json<Value>, Response> {
     let instance = ctx
         .state
-        .instances
-        .read()
+        .instance(&instance_id)
         .await
-        .get(&instance_id)
-        .cloned()
         .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "Instance not found"))?;
-
-    if let Some(container_id) = instance
-        .get("container_id")
-        .and_then(|v| v.as_str())
-        .filter(|id| !id.is_empty())
-    {
-        let docker = get_docker(&ctx).await?;
-        return Ok(Json(docker.get_container_stats(container_id).await));
-    }
-
-    let shell_pid = ctx
-        .state
-        .pty_sessions
-        .read()
-        .await
-        .get(&instance_id)
-        .and_then(|s| s.shell_pid);
-    let stats = match shell_pid {
-        Some(pid) => tokio::task::spawn_blocking(move || process_stats::process_tree_stats(pid))
-            .await
-            .unwrap_or_else(|_| process_stats::zeros()),
-        None => process_stats::zeros(),
-    };
-    Ok(Json(stats))
+    let pid = shell_pid(&ctx.state, &instance_id).await;
+    Ok(Json(
+        ctx.sandboxes
+            .for_instance(&instance)
+            .stats(&instance, pid)
+            .await,
+    ))
 }
 
 async fn focus_instance(
     State(ctx): State<ServerCtx>,
     Path(instance_id): Path<String>,
 ) -> Result<Json<Value>, Response> {
-    if !ctx.state.instances.read().await.contains_key(&instance_id) {
+    if ctx.state.instance(&instance_id).await.is_none() {
         return Err(api_err(StatusCode::NOT_FOUND, "Instance not found"));
     }
     Ok(Json(json!({ "status": "ok" })))
 }
 
-/// Collapses a prompt to one line so it is submitted once: interior newlines
-/// would otherwise be read as several separate submissions.
-fn prompt_as_single_line(prompt: &str) -> String {
-    prompt.split_whitespace().collect::<Vec<_>>().join(" ")
-}
+/// Delivers handoff prompts to instances' running shells.
+struct ShellPrompts<'a>(&'a AppState);
 
-/// Types `prompt` into the instance's terminal and submits it with `\r`
-/// (what the Enter key sends). Raw-mode TUIs such as Claude Code treat `\n`
-/// as "insert newline", not "submit". The submit key is sent separately after
-/// a short pause so TUIs don't fold it into the pasted text.
-async fn send_prompt_to_instance(state: &AppState, instance_id: &str, prompt: &str) -> bool {
-    let Some(input_tx) = state
-        .pty_sessions
-        .read()
-        .await
-        .get(instance_id)
-        .map(|s| s.input_tx.clone())
-    else {
-        return false;
-    };
-    if input_tx
-        .send(prompt_as_single_line(prompt).into_bytes())
-        .is_err()
-    {
-        return false;
+impl PromptSink for ShellPrompts<'_> {
+    async fn send_prompt(&self, instance_id: &str, prompt: &str) -> bool {
+        pty::type_prompt(self.0, instance_id, prompt).await
     }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    input_tx.send(b"\r".to_vec()).is_ok()
 }
 
 async fn execute_handoff(
     State(ctx): State<ServerCtx>,
     Json(body): Json<HandoffRequest>,
 ) -> Result<Response, Response> {
-    if !HANDOFF_METHODS.contains(&body.method.as_str()) {
-        return Err(api_err(
-            StatusCode::BAD_REQUEST,
-            format!("method must be one of {HANDOFF_METHODS:?}"),
-        ));
-    }
-
-    let project = ctx
-        .state
-        .projects
-        .read()
-        .await
-        .get(&body.project_id)
-        .cloned()
-        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "Project not found"))?;
-
-    let from_instance = ctx
-        .state
-        .instances
-        .read()
-        .await
-        .get(&body.from_instance_id)
-        .cloned()
-        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "from_instance not found"))?;
-    let to_instance = ctx
-        .state
-        .instances
-        .read()
-        .await
-        .get(&body.to_instance_id)
-        .cloned()
-        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "to_instance not found"))?;
-
-    if from_instance.get("project_id").and_then(|v| v.as_str()) != Some(body.project_id.as_str()) {
-        return Err(api_err(
-            StatusCode::BAD_REQUEST,
-            "from_instance does not belong to project_id",
-        ));
-    }
-    if to_instance.get("project_id").and_then(|v| v.as_str()) != Some(body.project_id.as_str()) {
-        return Err(api_err(
-            StatusCode::BAD_REQUEST,
-            "to_instance does not belong to project_id",
-        ));
-    }
-
-    let project_path = project
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| api_err(StatusCode::INTERNAL_SERVER_ERROR, "project path missing"))?;
-
-    let mut handoff_message = "Handoff complete".to_string();
-    let mut handoff_kind = "git_committed";
-    let injection_prompt = if body.method == "git" {
-        let outcome = match handoff::git_handoff(
-            project_path,
-            &format!("Handoff checkpoint: {}", body.task_description),
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                return Ok((
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "status": "error",
-                        "kind": "not_git_repo",
-                        "message": "Project is not a Git repository. Initialize git first or use Summary handoff."
-                    })),
-                )
-                    .into_response());
-            }
-        };
-        match outcome {
-            handoff::GitHandoffOutcome::Committed => {
-                "You are taking over this project. The previous AI just committed their work. Please review the latest git commit using 'git log -1 -p' to understand the current state of the codebase. Your overall goal is: {task}. Continue working on this goal from where the previous AI left off."
-            }
-            handoff::GitHandoffOutcome::NoChanges => {
-                handoff_kind = "git_no_changes";
-                handoff_message = "Handoff complete; no git changes needed a new commit".to_string();
-                "You are taking over this project. The previous AI found no uncommitted changes to checkpoint. Please inspect the current worktree and recent history with 'git status' and 'git log -1 --stat'. Your overall goal is: {task}. Continue working on this goal from where the previous AI left off."
-            }
-        }
-        .replace("{task}", &body.task_description)
-    } else {
-        let merged = merged_project_config(&ctx, &body.project_id, project_path).await?;
-        let handoff_template = merged
-            .get("handoff_template")
-            .and_then(|v| v.as_str())
-            .unwrap_or("generic");
-        let previous_snapshot = handoff::latest_handoff_snapshot(project_path);
-        let source_prompt =
-            handoff::build_summary_source_prompt(&body.task_description, handoff_template);
-        if !send_prompt_to_instance(&ctx.state, &body.from_instance_id, &source_prompt).await {
+    let method: HandoffMethod = parse_choice("method", &body.method)?;
+    let project = require_project(&ctx, &body.project_id).await?;
+    for (field, id) in [
+        ("from_instance", &body.from_instance_id),
+        ("to_instance", &body.to_instance_id),
+    ] {
+        let instance = ctx
+            .state
+            .instance(id)
+            .await
+            .ok_or_else(|| api_err(StatusCode::NOT_FOUND, format!("{field} not found")))?;
+        if instance.project_id != project.id {
             return Err(api_err(
                 StatusCode::BAD_REQUEST,
-                "from_instance does not have an active terminal session",
+                format!("{field} does not belong to project_id"),
             ));
         }
-
-        let ready = handoff::wait_for_latest_handoff(
-            project_path,
-            previous_snapshot,
-            handoff::HANDOFF_FILE_WAIT_TIMEOUT,
-        )
-        .await
-        .map_err(|e| {
-            api_err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed while waiting for handoff file: {e}"),
-            )
-        })?;
-
-        if !ready {
-            if let Err(e) = handoff::summary_handoff(project_path, &body.task_description).await {
-                return Err(api_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to write fallback handoff file: {e}"),
-                ));
-            }
-            return Ok((
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "status": "error",
-                    "kind": "summary_timed_out",
-                    "message": "Source AI did not create a handoff file within 60 seconds. A fallback handoff file was written with only the goal you provided; review it before handing off manually."
-                })),
-            )
-                .into_response());
-        }
-
-        handoff_kind = "summary_written";
-        handoff_message =
-            "Source AI wrote the handoff file; target AI was directed to read it".to_string();
-        format!(
-            "You are taking over this project. Read '.handover/handoffs/latest.md' for the handoff from the previous AI. Your overall goal is: {}. Continue from that file.",
-            body.task_description
-        )
+    }
+    let template = match method {
+        HandoffMethod::Summary => effective_config(&ctx, &project).await?.handoff_template,
+        HandoffMethod::Git => Default::default(),
     };
 
-    if !send_prompt_to_instance(&ctx.state, &body.to_instance_id, &injection_prompt).await {
-        return Err(api_err(
+    let plan = HandoffPlan {
+        project_path: &project.path,
+        from_instance_id: &body.from_instance_id,
+        to_instance_id: &body.to_instance_id,
+        method,
+        template,
+        task: &body.task_description,
+        summary_wait: handoff::HANDOFF_FILE_WAIT_TIMEOUT,
+    };
+    match handoff_flow::run(plan, &ShellPrompts(&ctx.state)).await {
+        Ok(outcome) => Ok(Json(json!({
+            "status": "ok",
+            "kind": outcome.kind(),
+            "message": outcome.message(),
+        }))
+        .into_response()),
+        Err(f @ (HandoffFailure::NotGitRepo | HandoffFailure::SummaryTimedOut)) => Ok((
             StatusCode::BAD_REQUEST,
-            "to_instance does not have an active terminal session",
-        ));
+            Json(json!({ "status": "error", "kind": f.kind(), "message": f.message() })),
+        )
+            .into_response()),
+        Err(f @ (HandoffFailure::SourceNotRunning | HandoffFailure::TargetNotRunning)) => {
+            Err(api_err(StatusCode::BAD_REQUEST, f.message()))
+        }
+        Err(f @ HandoffFailure::Internal(_)) => {
+            Err(api_err(StatusCode::INTERNAL_SERVER_ERROR, f.message()))
+        }
     }
-
-    Ok(
-        Json(json!({ "status": "ok", "kind": handoff_kind, "message": handoff_message }))
-            .into_response(),
-    )
 }
 
 async fn project_path_for(ctx: &ServerCtx, project_id: &str) -> Result<String, Response> {
-    ctx.state
-        .projects
-        .read()
-        .await
-        .get(project_id)
-        .and_then(|p| p.get("path").and_then(|v| v.as_str()).map(String::from))
-        .ok_or_else(|| api_err(StatusCode::NOT_FOUND, "Project not found"))
+    Ok(require_project(ctx, project_id).await?.path)
 }
 
 async fn list_project_handoffs(
@@ -939,48 +662,23 @@ async fn broadcast_prompt(
     if prompt.is_empty() {
         return Err(api_err(StatusCode::BAD_REQUEST, "prompt is required"));
     }
-    if !ctx.state.projects.read().await.contains_key(&project_id) {
-        return Err(api_err(StatusCode::NOT_FOUND, "Project not found"));
-    }
+    require_project(&ctx, &project_id).await?;
 
-    let instance_ids: Vec<String> = ctx
-        .state
-        .instances
-        .read()
-        .await
-        .iter()
-        .filter_map(|(id, inst)| {
-            if inst.get("project_id").and_then(|v| v.as_str()) == Some(project_id.as_str()) {
-                Some(id.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    let total = instance_ids.len();
+    let instances = ctx.state.instances_of(&project_id).await;
     let mut sent = 0u32;
-    for id in instance_ids {
-        if send_prompt_to_instance(&ctx.state, &id, prompt).await {
+    for instance in &instances {
+        if pty::type_prompt(&ctx.state, &instance.id, prompt).await {
             sent += 1;
         }
     }
-
     Ok(Json(
-        json!({ "status": "ok", "sent": sent, "total": total }),
+        json!({ "status": "ok", "sent": sent, "total": instances.len() }),
     ))
 }
 
-async fn project_resources(
-    State(ctx): State<ServerCtx>,
-    Path(project_id): Path<String>,
-) -> Result<Json<Value>, Response> {
-    if !ctx.state.projects.read().await.contains_key(&project_id) {
-        return Err(api_err(StatusCode::NOT_FOUND, "Project not found"));
-    }
-
+fn host_memory_mb() -> (f64, f64) {
     use sysinfo::{MemoryRefreshKind, RefreshKind, System};
-    let (total_mb, used_mb) = match System::new_with_specifics(
+    match System::new_with_specifics(
         RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
     ) {
         Ok(mut sys) => {
@@ -994,86 +692,53 @@ async fn project_resources(
             warn!("failed to read host memory: {e}");
             (0.0, 0.0)
         }
-    };
+    }
+}
+
+async fn project_resources(
+    State(ctx): State<ServerCtx>,
+    Path(project_id): Path<String>,
+) -> Result<Json<Value>, Response> {
+    let project = require_project(&ctx, &project_id).await?;
+    let (total_mb, used_mb) = tokio::task::spawn_blocking(host_memory_mb)
+        .await
+        .unwrap_or((0.0, 0.0));
     let ram_percent = if total_mb > 0.0 {
         used_mb / total_mb * 100.0
     } else {
         0.0
     };
 
-    let instances_map = ctx.state.instances.read().await;
-    let pty_sessions = ctx.state.pty_sessions.read().await;
-    let project = ctx.state.projects.read().await.get(&project_id).cloned();
-    let project_state = project
-        .as_ref()
-        .and_then(|p| p.get("state").and_then(|v| v.as_str()))
-        .unwrap_or("active")
-        .to_string();
+    let instances = ctx.state.instances_of(&project_id).await;
+    // A shell can be running with no window attached; it still counts.
+    let shells: HashMap<String, Option<u32>> = {
+        let sessions = ctx.state.pty_sessions.read().await;
+        instances
+            .iter()
+            .filter_map(|i| sessions.get(&i.id).map(|s| (i.id.clone(), s.shell_pid)))
+            .collect()
+    };
+    let stats = futures::future::join_all(instances.iter().map(|i| {
+        let pid = shells.get(&i.id).copied().flatten();
+        ctx.sandboxes.for_instance(i).stats(i, pid)
+    }))
+    .await;
 
-    let project_instances: Vec<(String, Value)> = instances_map
+    let rows: Vec<Value> = instances
         .iter()
-        .filter_map(|(id, inst)| {
-            if inst.get("project_id").and_then(|v| v.as_str()) == Some(project_id.as_str()) {
-                Some((id.clone(), inst.clone()))
-            } else {
-                None
-            }
+        .zip(stats)
+        .enumerate()
+        .map(|(index, (i, stats))| {
+            json!({
+                "instance_id": i.id,
+                "label": format!("Terminal {}", index + 1),
+                "sandbox_mode": i.sandbox_mode,
+                // True while the shell is running, attached window or not.
+                "connected": shells.contains_key(&i.id),
+                "stats": stats,
+            })
         })
         .collect();
-    drop(instances_map);
-    drop(project);
-
-    let docker = get_docker(&ctx).await.ok();
-    let mut instance_rows = Vec::new();
-    let mut native_pids: Vec<(usize, u32)> = Vec::new();
-
-    for (index, (instance_id, inst)) in project_instances.iter().enumerate() {
-        let container_id = inst
-            .get("container_id")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-
-        let stats = if let (Some(d), Some(cid)) = (docker.as_ref(), container_id.as_deref()) {
-            d.get_container_stats(cid).await
-        } else if let Some(pid) = pty_sessions.get(instance_id).and_then(|s| s.shell_pid) {
-            native_pids.push((index, pid));
-            process_stats::zeros()
-        } else {
-            process_stats::zeros()
-        };
-
-        instance_rows.push(json!({
-            "instance_id": instance_id,
-            "label": format!("Terminal {}", index + 1),
-            "sandbox_mode": inst.get("sandbox_mode"),
-            // True while the shell is running, attached window or not.
-            "connected": pty_sessions.contains_key(instance_id),
-            "stats": stats,
-        }));
-    }
-    drop(pty_sessions);
-
-    if !native_pids.is_empty() {
-        let measured = tokio::task::spawn_blocking(move || {
-            let pids: Vec<u32> = native_pids.iter().map(|(_, pid)| *pid).collect();
-            let stats_by_pid = process_stats::process_tree_stats_batch(&pids);
-            native_pids
-                .into_iter()
-                .zip(stats_by_pid.into_iter().map(|(_, stats)| stats))
-                .map(|((index, _), stats)| (index, stats))
-                .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_default();
-        for (index, stats) in measured {
-            if let Some(row) = instance_rows.get_mut(index) {
-                if let Some(obj) = row.as_object_mut() {
-                    obj.insert("stats".into(), stats);
-                }
-            }
-        }
-    }
 
     Ok(Json(json!({
         "system": {
@@ -1084,10 +749,10 @@ async fn project_resources(
             "emergency_threshold_percent": RAM_EMERGENCY_THRESHOLD,
         },
         "project": {
-            "state": project_state,
-            "instance_count": instance_rows.len(),
+            "state": project.state,
+            "instance_count": rows.len(),
         },
-        "instances": instance_rows,
+        "instances": rows,
     })))
 }
 
@@ -1104,51 +769,8 @@ async fn ws_pty(
     Ok(ws.on_upgrade(move |socket| pty::handle_pty_socket(socket, instance_id, params, state)))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    init_tracing();
-    let cli = Cli::parse();
-
-    let state = AppState::new();
-    if let Err(e) = state.load_persisted().await {
-        warn!("[startup] failed to load persisted app state: {e}");
-    }
-    let docker_slot: Arc<RwLock<Option<Arc<DockerRuntime>>>> = Arc::new(RwLock::new(None));
-
-    match DockerRuntime::new() {
-        Ok(runtime) => {
-            let arc = Arc::new(runtime);
-            let removed = arc.cleanup_orphans().await;
-            tracing::debug!("[startup] removed {removed} orphaned sandbox container(s)");
-            let removed_nss = arc.cleanup_nss_temp_dirs().await;
-            tracing::debug!("[startup] removed {removed_nss} stale nss temp dir(s)");
-            *docker_slot.write().await = Some(arc);
-        }
-        Err(e) => {
-            tracing::debug!("[startup] Docker unavailable; skipping container cleanup: {e}");
-        }
-    }
-    governor::spawn_governor(state.clone(), docker_slot.clone());
-
-    let ctx = ServerCtx {
-        state,
-        docker: docker_slot,
-    };
-
-    // Per-launch secret from the desktop shell (env, not argv, so other
-    // local users can't read it from the process list).
-    let token = match std::env::var("HANDOVER_TOKEN") {
-        Ok(t) if !t.trim().is_empty() => auth::AuthToken(t.trim().into()),
-        _ => {
-            let t = auth::AuthToken::generate();
-            // Standalone/dev runs: print it so a browser dev session can use
-            // http://127.0.0.1:5173/?port=<port>&token=<token>
-            println!("handover-backend token: {}", t.0);
-            t
-        }
-    };
-
-    let app = Router::new()
+fn app(ctx: ServerCtx, token: auth::AuthToken) -> Router {
+    Router::new()
         .route("/", get(root))
         .route("/api/health/docker", get(docker_health))
         .route("/api/config", get(get_config).put(update_config))
@@ -1199,7 +821,59 @@ async fn main() -> anyhow::Result<()> {
             token,
             auth::require_token,
         ))
-        .layer(auth::cors_layer());
+        .layer(auth::cors_layer())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    init_tracing();
+    let cli = Cli::parse();
+
+    let state = AppState::new();
+    if let Err(e) = state.load_persisted().await {
+        warn!("[startup] failed to load persisted app state: {e}");
+    }
+    let docker_slot: Arc<RwLock<Option<Arc<DockerRuntime>>>> = Arc::new(RwLock::new(None));
+
+    match DockerRuntime::new() {
+        Ok(runtime) => {
+            let arc = Arc::new(runtime);
+            let removed = arc.cleanup_orphans().await;
+            tracing::debug!("[startup] removed {removed} orphaned sandbox container(s)");
+            let removed_nss = arc.cleanup_nss_temp_dirs().await;
+            tracing::debug!("[startup] removed {removed_nss} stale nss temp dir(s)");
+            *docker_slot.write().await = Some(arc);
+        }
+        Err(e) => {
+            tracing::debug!("[startup] Docker unavailable; skipping container cleanup: {e}");
+        }
+    }
+    let sandboxes = Sandboxes::new(
+        Arc::new(NativeSandbox),
+        Arc::new(DockerSandbox::new(docker_slot.clone())),
+    );
+    governor::spawn_governor(state.clone(), sandboxes.clone());
+
+    let ctx = ServerCtx {
+        state,
+        docker: docker_slot,
+        sandboxes,
+    };
+
+    // Per-launch secret from the desktop shell (env, not argv, so other
+    // local users can't read it from the process list).
+    let token = match std::env::var("HANDOVER_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => auth::AuthToken(t.trim().into()),
+        _ => {
+            let t = auth::AuthToken::generate();
+            // Standalone/dev runs: print it so a browser dev session can use
+            // http://127.0.0.1:5173/?port=<port>&token=<token>
+            println!("handover-backend token: {}", t.0);
+            t
+        }
+    };
+
+    let app = app(ctx, token);
 
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
     tracing::debug!("handover-backend listening on http://{addr}");
@@ -1211,13 +885,209 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::fake::FakeSandbox;
+    use axum::body::Body;
+    use axum::http::Request;
     use std::path::PathBuf;
+    use tower::ServiceExt;
 
-    #[test]
-    fn prompt_as_single_line_collapses_newlines() {
+    const TOKEN: &str = "test-token";
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        project_dir: PathBuf,
+        ctx: ServerCtx,
+        docker: Arc<FakeSandbox>,
+    }
+
+    fn harness(docker: FakeSandbox) -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join("proj");
+        std::fs::create_dir(&project_dir).unwrap();
+        let docker = Arc::new(docker);
+        let ctx = ServerCtx {
+            state: AppState::with_persist_path(dir.path().join("state.json")),
+            docker: Arc::new(RwLock::new(None)),
+            sandboxes: Sandboxes::new(Arc::new(NativeSandbox), docker.clone()),
+        };
+        Harness {
+            _dir: dir,
+            project_dir,
+            ctx,
+            docker,
+        }
+    }
+
+    impl Harness {
+        async fn call(&self, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .header("x-handover-token", TOKEN)
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let res = app(self.ctx.clone(), auth::AuthToken(TOKEN.into()))
+                .oneshot(req)
+                .await
+                .unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            )
+        }
+
+        async fn create_project(&self) -> String {
+            let (status, p) = self
+                .call(
+                    "POST",
+                    "/api/projects",
+                    json!({ "path": self.project_dir, "sandbox_mode": "docker" }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{p}");
+            p["id"].as_str().unwrap().to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn docker_instance_is_provisioned_and_torn_down_through_the_sandbox() {
+        let h = harness(FakeSandbox {
+            container: Some("c1".into()),
+            ..Default::default()
+        });
+        let pid = h.create_project().await;
+        let (status, inst) = h
+            .call(
+                "POST",
+                "/api/instances/start",
+                json!({ "project_id": pid, "sandbox_mode": "docker", "mem_limit": "1g" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{inst}");
+        assert_eq!(inst["container_id"], "c1");
+        assert_eq!(inst["mem_limit"], "1g");
+        let iid = inst["id"].as_str().unwrap();
+
+        let (_, stats) = h
+            .call("GET", &format!("/api/instances/{iid}/stats"), Value::Null)
+            .await;
+        assert_eq!(stats["cpu_percent"], 3.0);
+
+        h.call("DELETE", &format!("/api/instances/{iid}"), Value::Null)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(
-            prompt_as_single_line("  fix\nthe\r\n  bug \n"),
-            "fix the bug"
+            h.docker.calls(),
+            [
+                format!("provision {iid}"),
+                format!("stats {iid}"),
+                format!("teardown {iid}")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_sandbox_is_a_503() {
+        let h = harness(FakeSandbox {
+            fail_provision: true,
+            ..Default::default()
+        });
+        let pid = h.create_project().await;
+        let (status, _) = h
+            .call("POST", "/api/instances/start", json!({ "project_id": pid }))
+            .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(h.ctx.state.instances.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_instances_never_touch_docker() {
+        let h = harness(FakeSandbox::default());
+        let pid = h.create_project().await;
+        let (status, inst) = h
+            .call(
+                "POST",
+                "/api/instances/start",
+                json!({ "project_id": pid, "sandbox_mode": "native" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(inst["container_id"], Value::Null);
+        assert!(inst.get("mem_limit").is_none());
+        h.call("POST", &format!("/api/projects/{pid}/unload"), Value::Null)
+            .await;
+        assert!(h.docker.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_choices_are_rejected_with_400() {
+        let h = harness(FakeSandbox::default());
+        let pid = h.create_project().await;
+        let (status, body) = h
+            .call(
+                "PUT",
+                &format!("/api/projects/{pid}/config"),
+                json!({ "sandbox_mode": "vm" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["detail"].as_str().unwrap().contains("sandbox_mode"));
+    }
+
+    #[tokio::test]
+    async fn saved_config_round_trips_and_renames_the_project() {
+        let h = harness(FakeSandbox::default());
+        let pid = h.create_project().await;
+        let (status, _) = h
+            .call(
+                "PUT",
+                &format!("/api/projects/{pid}/config"),
+                json!({ "project_name": "Renamed", "sandbox_mode": "native", "handoff_template": "rust-cli" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, cfg) = h
+            .call("GET", &format!("/api/projects/{pid}/config"), Value::Null)
+            .await;
+        assert_eq!(cfg["handoff_template"], "rust-cli");
+        assert_eq!(cfg["sandbox_mode"], "native");
+        let (_, list) = h.call("GET", "/api/projects", Value::Null).await;
+        assert_eq!(list[0]["name"], "Renamed");
+        assert_eq!(list[0]["config"]["project_name"], "Renamed");
+    }
+
+    #[tokio::test]
+    async fn suspended_project_resumes_its_instances_on_activate() {
+        let h = harness(FakeSandbox {
+            container: Some("c1".into()),
+            ..Default::default()
+        });
+        let pid = h.create_project().await;
+        h.call("POST", "/api/instances/start", json!({ "project_id": pid }))
+            .await;
+        h.ctx
+            .state
+            .projects
+            .write()
+            .await
+            .get_mut(&pid)
+            .unwrap()
+            .state = ProjectState::Suspended;
+        h.call(
+            "POST",
+            &format!("/api/projects/{pid}/activate"),
+            Value::Null,
+        )
+        .await;
+        assert!(h.docker.calls().iter().any(|c| c.starts_with("resume ")));
+        assert_eq!(
+            h.ctx.state.project(&pid).await.unwrap().state,
+            ProjectState::Active
         );
     }
 

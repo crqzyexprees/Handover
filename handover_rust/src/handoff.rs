@@ -221,7 +221,7 @@ pub async fn list_handoff_files(project_path: &str) -> Result<Vec<HandoffFileInf
         });
     }
 
-    entries.sort_by(|a, b| handoff_sort_key(&b.filename).cmp(&handoff_sort_key(&a.filename)));
+    entries.sort_by_key(|e| std::cmp::Reverse(handoff_sort_key(&e.filename)));
     Ok(entries)
 }
 

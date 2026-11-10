@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -101,7 +101,7 @@ impl DockerRuntime {
         project_path: &str,
         instance_id: &str,
         mem_limit: &str,
-        custom_env_vars: Option<&HashMap<String, String>>,
+        custom_env_vars: &BTreeMap<String, String>,
     ) -> Result<String> {
         let uid = users::get_current_uid();
         let gid = users::get_current_gid();
@@ -121,10 +121,8 @@ impl DockerRuntime {
                 }
             }
         }
-        if let Some(custom) = custom_env_vars {
-            for (k, v) in custom {
-                env.push(format!("{k}={v}"));
-            }
+        for (k, v) in custom_env_vars {
+            env.push(format!("{k}={v}"));
         }
 
         let mut binds = vec![

@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
-use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::docker::DockerRuntime;
+use crate::model::ProjectState;
+use crate::sandbox::Sandboxes;
 use crate::state::{
     project_container_ids, AppState, GOVERNOR_INTERVAL_SECS, RAM_EMERGENCY_THRESHOLD,
     RAM_SUSPEND_THRESHOLD,
 };
 
-pub fn spawn_governor(state: Arc<AppState>, docker_slot: Arc<RwLock<Option<Arc<DockerRuntime>>>>) {
+pub fn spawn_governor(state: Arc<AppState>, sandboxes: Sandboxes) {
     tokio::spawn(async move {
         let mut sys = match System::new_with_specifics(
             RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
@@ -23,11 +23,8 @@ pub fn spawn_governor(state: Arc<AppState>, docker_slot: Arc<RwLock<Option<Arc<D
         };
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(GOVERNOR_INTERVAL_SECS)).await;
-            let docker = docker_slot.read().await.clone();
-            if let Some(docker) = docker.as_ref() {
-                if let Err(e) = tick(&state, docker, &mut sys).await {
-                    warn!("[governor] tick error: {e}");
-                }
+            if let Err(e) = tick(&state, &sandboxes, &mut sys).await {
+                warn!("[governor] tick error: {e}");
             }
         }
     });
@@ -41,7 +38,7 @@ async fn suspendable_projects(state: &AppState) -> Vec<String> {
         if Some(pid.clone()) == focused {
             continue;
         }
-        if project.get("state").and_then(|v| v.as_str()) == Some("suspended") {
+        if project.state == ProjectState::Suspended {
             continue;
         }
         let containers = project_container_ids(state, pid).await;
@@ -58,34 +55,29 @@ async fn suspendable_projects(state: &AppState) -> Vec<String> {
     candidates
 }
 
-async fn suspend_project(state: &AppState, docker: &DockerRuntime, project_id: &str) -> bool {
-    let container_ids = project_container_ids(state, project_id).await;
-    if container_ids.is_empty() {
+async fn suspend_project(state: &AppState, sandboxes: &Sandboxes, project_id: &str) -> bool {
+    let mut paused = 0;
+    for instance in state.instances_of(project_id).await {
+        match sandboxes.for_instance(&instance).suspend(&instance).await {
+            Ok(true) => paused += 1,
+            Ok(false) => {}
+            Err(e) => warn!("[governor] failed to suspend instance {}: {e}", instance.id),
+        }
+    }
+    if paused == 0 {
         return false;
     }
-    for id in &container_ids {
-        if let Err(e) = docker.pause_container(id).await {
-            warn!("[governor] failed to pause container {id}: {e}");
-        }
+    if let Some(project) = state.projects.write().await.get_mut(project_id) {
+        project.state = ProjectState::Suspended;
     }
-    let mut projects = state.projects.write().await;
-    if let Some(project) = projects.get_mut(project_id) {
-        if let Some(obj) = project.as_object_mut() {
-            obj.insert("state".into(), serde_json::json!("suspended"));
-        }
-    }
-    drop(projects);
     if let Err(e) = state.save_persisted().await {
         warn!("[governor] failed to persist suspended state: {e}");
     }
-    info!(
-        "[governor] suspended project {project_id} ({} container(s) paused)",
-        container_ids.len()
-    );
+    info!("[governor] suspended project {project_id} ({paused} instance(s) paused)");
     true
 }
 
-async fn tick(state: &AppState, docker: &DockerRuntime, sys: &mut System) -> anyhow::Result<()> {
+async fn tick(state: &AppState, sandboxes: &Sandboxes, sys: &mut System) -> anyhow::Result<()> {
     sys.refresh_memory();
     let percent = sys.used_memory() as f32 / sys.total_memory().max(1) as f32 * 100.0;
 
@@ -100,7 +92,7 @@ async fn tick(state: &AppState, docker: &DockerRuntime, sys: &mut System) -> any
             );
         }
         for pid in targets {
-            suspend_project(state, docker, &pid).await;
+            suspend_project(state, sandboxes, &pid).await;
         }
     } else if percent >= RAM_SUSPEND_THRESHOLD {
         let targets = suspendable_projects(state).await;
@@ -109,7 +101,7 @@ async fn tick(state: &AppState, docker: &DockerRuntime, sys: &mut System) -> any
                 "[governor] RAM {:.0}% >= {:.0}% — suspending LRU project {pid}",
                 percent, RAM_SUSPEND_THRESHOLD
             );
-            suspend_project(state, docker, pid).await;
+            suspend_project(state, sandboxes, pid).await;
         }
     }
     Ok(())

@@ -13,13 +13,12 @@
 //! Offsets count UTF-16 code units of output text, which is what a browser's
 //! `string.length` measures, so client and server agree on positions.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use anyhow::Context;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket};
 use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
@@ -29,6 +28,7 @@ use serde_json::json;
 use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 use tracing::warn;
 
+use crate::sandbox;
 use crate::state::AppState;
 
 const CONTROL_PREFIX: &str = "__handover_control__:";
@@ -177,58 +177,16 @@ impl PtySession {
     }
 }
 
-struct SpawnTarget {
-    sandbox_mode: String,
-    container_id: Option<String>,
-    cwd: Option<PathBuf>,
-    env_vars: HashMap<String, String>,
-}
-
 /// Reads what is needed to start this instance's shell.
-async fn spawn_target(state: &AppState, instance_id: &str) -> Result<SpawnTarget, String> {
+async fn spawn_command(state: &AppState, instance_id: &str) -> Result<CommandBuilder, String> {
     let instance = state
-        .instances
-        .read()
+        .instance(instance_id)
         .await
-        .get(instance_id)
-        .cloned()
         .ok_or("Instance not found. Close this terminal and open a new one.")?;
-    let sandbox_mode = instance
-        .get("sandbox_mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("docker")
-        .to_string();
-    let container_id = instance
-        .get("container_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    if sandbox_mode == "docker" && container_id.is_none() {
-        return Err(
-            "Docker container is not running for this terminal. Try closing and reopening it."
-                .into(),
-        );
-    }
-    let env_vars: HashMap<String, String> = instance
-        .get("custom_env_vars")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default();
-    let project_path = match instance.get("project_id").and_then(|v| v.as_str()) {
-        Some(pid) => state
-            .projects
-            .read()
-            .await
-            .get(pid)
-            .and_then(|p| p.get("path").and_then(|v| v.as_str()).map(String::from)),
-        None => None,
-    };
-    let cwd = project_path
-        .map(PathBuf::from)
+    let cwd = state
+        .project(&instance.project_id)
+        .await
+        .map(|p| PathBuf::from(p.path))
         .filter(|p| p.is_dir())
         .or_else(|| {
             std::env::var("HOME")
@@ -236,11 +194,9 @@ async fn spawn_target(state: &AppState, instance_id: &str) -> Result<SpawnTarget
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir())
         });
-    Ok(SpawnTarget {
-        sandbox_mode,
-        container_id,
-        cwd,
-        env_vars,
+    sandbox::shell_command(&instance, cwd.as_deref()).map_err(|_| {
+        "Docker container is not running for this terminal. Try closing and reopening it."
+            .to_string()
     })
 }
 
@@ -248,19 +204,12 @@ async fn spawn_target(state: &AppState, instance_id: &str) -> Result<SpawnTarget
 async fn spawn_session(
     state: &Arc<AppState>,
     instance_id: &str,
-    target: SpawnTarget,
+    cmd: CommandBuilder,
 ) -> Result<Arc<PtySession>, String> {
-    let handles = tokio::task::spawn_blocking(move || {
-        spawn_pty_child(
-            &target.sandbox_mode,
-            target.container_id.as_deref(),
-            target.cwd.as_deref(),
-            &target.env_vars,
-        )
-    })
-    .await
-    .map_err(|e| format!("Failed to start shell: {e}"))?
-    .map_err(|e| format!("Failed to start shell: {e}"))?;
+    let handles = tokio::task::spawn_blocking(move || spawn_pty_child(cmd))
+        .await
+        .map_err(|e| format!("Failed to start shell: {e}"))?
+        .map_err(|e| format!("Failed to start shell: {e}"))?;
 
     let PtyHandles {
         reader,
@@ -365,14 +314,45 @@ async fn get_or_spawn_session(
             return Ok(existing.clone());
         }
     }
-    let target = spawn_target(state, instance_id).await?;
-    let session = spawn_session(state, instance_id, target).await?;
+    let cmd = spawn_command(state, instance_id).await?;
+    let session = spawn_session(state, instance_id, cmd).await?;
     state
         .pty_sessions
         .write()
         .await
         .insert(instance_id.to_string(), session.clone());
     Ok(session)
+}
+
+/// Collapses a prompt to one line so it is submitted once: interior newlines
+/// would otherwise be read as several separate submissions.
+fn prompt_as_single_line(prompt: &str) -> String {
+    prompt.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Types `prompt` into the instance's running shell and submits it with `\r`
+/// (what the Enter key sends). Raw-mode TUIs such as Claude Code treat `\n`
+/// as "insert newline", not "submit". The submit key is sent separately after
+/// a short pause so TUIs don't fold it into the pasted text. False if the
+/// instance has no running shell.
+pub async fn type_prompt(state: &AppState, instance_id: &str, prompt: &str) -> bool {
+    let Some(input_tx) = state
+        .pty_sessions
+        .read()
+        .await
+        .get(instance_id)
+        .map(|s| s.input_tx.clone())
+    else {
+        return false;
+    };
+    if input_tx
+        .send(prompt_as_single_line(prompt).into_bytes())
+        .is_err()
+    {
+        return false;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    input_tx.send(b"\r".to_vec()).is_ok()
 }
 
 /// Called when an instance is deleted or its project unloaded: kills the
@@ -584,12 +564,7 @@ struct PtyHandles {
     child: Box<dyn Child + Send>,
 }
 
-fn spawn_pty_child(
-    sandbox_mode: &str,
-    container_id: Option<&str>,
-    cwd: Option<&std::path::Path>,
-    env_vars: &HashMap<String, String>,
-) -> anyhow::Result<PtyHandles> {
+fn spawn_pty_child(cmd: CommandBuilder) -> anyhow::Result<PtyHandles> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows: 24,
@@ -597,27 +572,6 @@ fn spawn_pty_child(
         pixel_width: 0,
         pixel_height: 0,
     })?;
-
-    let cmd = if sandbox_mode == "native" {
-        // Same flags the Python pexpect backend used
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        let mut c = CommandBuilder::new(&shell);
-        c.args(["-l", "-i"]);
-        if let Some(cwd) = cwd {
-            c.cwd(cwd);
-        }
-        for (k, v) in env_vars {
-            c.env(k, v);
-        }
-        c.env("TERM", "xterm-256color");
-        c
-    } else {
-        let cid = container_id.context("missing container_id")?;
-        let mut c = CommandBuilder::new("docker");
-        c.args(["exec", "-it", cid, "/bin/bash"]);
-        c.env("TERM", "xterm-256color");
-        c
-    };
 
     let child = pair.slave.spawn_command(cmd)?;
     drop(pair.slave);
@@ -635,6 +589,14 @@ fn spawn_pty_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_as_single_line_collapses_newlines() {
+        assert_eq!(
+            prompt_as_single_line("  fix\nthe\r\n  bug \n"),
+            "fix the bug"
+        );
+    }
 
     #[test]
     fn drain_utf8_keeps_split_character_for_next_read() {
