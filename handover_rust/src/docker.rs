@@ -26,6 +26,31 @@ pub const NSS_DIR_PREFIX: &str = "handover-nss-";
 
 const FORWARDED_API_KEYS: &[&str] = &["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
 
+/// Where an instance's secret env file is mounted. API keys and custom env
+/// vars go here (read-only, mode 0600 on the host) rather than into the
+/// container's environment, where `docker inspect` would show them to
+/// anyone who can talk to the Docker daemon. The shell sources it on start.
+pub const SANDBOX_ENV_FILE: &str = "/run/handover/env";
+
+fn is_env_name(k: &str) -> bool {
+    let mut chars = k.chars();
+    matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+/// `export K='v'` lines that bash can source; values are single-quoted.
+fn env_file_contents<'a>(vars: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    let mut out = String::new();
+    for (k, v) in vars {
+        if !is_env_name(k) {
+            tracing::warn!("skipping env var with invalid name {k:?}");
+            continue;
+        }
+        out.push_str(&format!("export {k}='{}'\n", v.replace('\'', r"'\''")));
+    }
+    out
+}
+
 const CONFIG_MOUNTS: &[(&str, &str)] = &[
     ("~/.claude", ".claude"),
     ("~/.codex", ".codex"),
@@ -91,6 +116,15 @@ impl DockerRuntime {
         })
     }
 
+    fn env_file_path(&self, instance_id: &str) -> PathBuf {
+        self._nss_dir.path().join(format!("env-{instance_id}"))
+    }
+
+    /// Deletes an instance's secret env file (after its container is gone).
+    pub fn forget_instance(&self, instance_id: &str) {
+        let _ = std::fs::remove_file(self.env_file_path(instance_id));
+    }
+
     pub async fn ping(&self) -> Result<()> {
         self.docker.ping().await.context("docker ping failed")?;
         Ok(())
@@ -108,27 +142,33 @@ impl DockerRuntime {
         let mem_bytes = parse_mem_bytes(mem_limit);
         let nss_path = self._nss_dir.path();
 
-        let mut env = vec![
+        let env = vec![
             format!("HOME={SANDBOX_HOME}"),
             format!("PATH={SANDBOX_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"),
         ];
-        // Runtime-only: values come from the host process environment.
+
+        // Runtime-only: API key values come from the host process environment.
         // Never write these into the image, Dockerfile, or git.
-        for key in FORWARDED_API_KEYS {
-            if let Ok(val) = std::env::var(key) {
-                if !val.trim().is_empty() {
-                    env.push(format!("{key}={val}"));
-                }
-            }
-        }
-        for (k, v) in custom_env_vars {
-            env.push(format!("{k}={v}"));
-        }
+        let forwarded: Vec<(&str, String)> = FORWARDED_API_KEYS
+            .iter()
+            .filter_map(|&k| std::env::var(k).ok().map(|v| (k, v)))
+            .filter(|(_, v)| !v.trim().is_empty())
+            .collect();
+        let secrets = env_file_contents(
+            forwarded.iter().map(|(k, v)| (*k, v.as_str())).chain(
+                custom_env_vars
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
+            ),
+        );
+        let env_file = self.env_file_path(instance_id);
+        write_private_file(&env_file, &secrets)?;
 
         let mut binds = vec![
             format!("{project_path}:/workspace:rw,z"),
             format!("{}/passwd:/etc/passwd:ro,z", nss_path.display()),
             format!("{}/group:/etc/group:ro,z", nss_path.display()),
+            format!("{}:{SANDBOX_ENV_FILE}:ro,z", env_file.display()),
         ];
 
         for (host, rel) in CONFIG_MOUNTS {
@@ -180,13 +220,20 @@ impl DockerRuntime {
         };
 
         let name = format!("handover-{instance_id}");
-        let create = self
+        let create = match self
             .docker
             .create_container(
                 Some(CreateContainerOptionsBuilder::default().name(&name).build()),
                 config,
             )
-            .await?;
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                self.forget_instance(instance_id);
+                return Err(e.into());
+            }
+        };
 
         let id = create.id;
         // Never leave a created-but-unstarted container behind.
@@ -196,6 +243,7 @@ impl DockerRuntime {
             .await
         {
             let _ = self.stop_container(&id).await;
+            self.forget_instance(instance_id);
             return Err(e).context("failed to start sandbox container");
         }
 
@@ -359,6 +407,22 @@ fn parse_mem_bytes(mem_limit: &str) -> i64 {
     2 * 1024 * 1024 * 1024
 }
 
+/// Writes a file only the current user can read.
+fn write_private_file(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    f.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
 fn build_nss_files() -> Result<TempDir> {
     let dir = tempfile::Builder::new()
         .prefix(NSS_DIR_PREFIX)
@@ -461,5 +525,35 @@ mod tests {
     fn parse_mem_bytes_falls_back_for_invalid_values() {
         assert_eq!(parse_mem_bytes("bad"), 2 * 1024 * 1024 * 1024);
         assert_eq!(parse_mem_bytes(""), 2 * 1024 * 1024 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod env_file_tests {
+    use super::*;
+
+    #[test]
+    fn env_file_quotes_values_and_skips_bad_names() {
+        let out = env_file_contents([("A_KEY", "it's $HOME"), ("bad-name", "x"), ("B", "")]);
+        assert_eq!(out, "export A_KEY='it'\\''s $HOME'\nexport B=''\n");
+    }
+
+    #[test]
+    fn env_file_round_trips_through_bash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("env");
+        let tricky = "a'b\"c $(touch /nope) `x` \\ \n line2";
+        write_private_file(&path, &env_file_contents([("K", tricky)])).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let out = std::process::Command::new("bash")
+            .args(["-c", &format!(". {}; printf %s \"$K\"", path.display())])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), tricky);
     }
 }

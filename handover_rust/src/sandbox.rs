@@ -16,7 +16,7 @@ use portable_pty::CommandBuilder;
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use crate::docker::DockerRuntime;
+use crate::docker::{DockerRuntime, SANDBOX_ENV_FILE};
 use crate::model::{Instance, SandboxMode};
 use crate::process_stats;
 
@@ -86,7 +86,10 @@ pub fn shell_command(instance: &Instance, cwd: Option<&Path>) -> anyhow::Result<
         SandboxMode::Docker => {
             let cid = instance.container_id().context("missing container_id")?;
             let mut c = CommandBuilder::new("docker");
-            c.args(["exec", "-it", cid, "/bin/bash"]);
+            // Load the instance's secrets (see docker::SANDBOX_ENV_FILE), then
+            // become the interactive shell.
+            let start = format!(". {SANDBOX_ENV_FILE} 2>/dev/null; exec /bin/bash");
+            c.args(["exec", "-it", cid, "/bin/bash", "-c", &start]);
             c
         }
     };
@@ -190,9 +193,11 @@ impl Sandbox for DockerSandbox {
 
     fn teardown<'a>(&'a self, instance: &'a Instance) -> BoxFuture<'a, SandboxResult<()>> {
         async move {
+            let rt = self.runtime().await?;
             if let Some(cid) = instance.container_id() {
-                self.runtime().await?.stop_container(cid).await?;
+                rt.stop_container(cid).await?;
             }
+            rt.forget_instance(&instance.id);
             Ok(())
         }
         .boxed()
@@ -350,7 +355,8 @@ mod tests {
             .iter()
             .map(|a| a.to_string_lossy().into())
             .collect();
-        assert_eq!(argv, ["docker", "exec", "-it", "abc", "/bin/bash"]);
+        assert_eq!(&argv[..5], ["docker", "exec", "-it", "abc", "/bin/bash"]);
+        assert!(argv[6].contains(SANDBOX_ENV_FILE));
     }
 
     #[test]

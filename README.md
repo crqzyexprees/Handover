@@ -95,7 +95,12 @@ Cursor CLI (`claude`, `codex`, `cursor-agent` / `agent`). Host CLI updates do
 ```
 
 Then open a **new** Docker terminal in Handover — existing containers keep the
-old image. Details: [`handover/docker/README.md`](handover/docker/README.md).
+old image.
+
+`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` (from the app's environment) and a
+project's custom env vars reach the container through a read-only, owner-only
+file that the shell sources at start, not the container environment, so they
+don't show up in `docker inspect`. Details: [`handover/docker/README.md`](handover/docker/README.md).
 
 ## Features
 
