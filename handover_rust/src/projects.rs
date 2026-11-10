@@ -27,10 +27,10 @@ use uuid::Uuid;
 
 use crate::local_config;
 use crate::model::{
-    basename_from_path, Instance, Project, ProjectConfig, ProjectState, SandboxMode,
+    basename_from_path, Instance, Project, ProjectConfig, ProjectState, ResourceStats, SandboxMode,
 };
 use crate::pty::Terminals;
-use crate::sandbox::{self, ProvisionRequest, SandboxError, Sandboxes};
+use crate::sandbox::{ProvisionRequest, SandboxError, Sandboxes};
 use crate::state::{self, monotonic_secs, Snapshot};
 
 #[derive(Debug)]
@@ -68,6 +68,13 @@ pub struct ProjectView {
     pub project: Project,
     pub config: ProjectConfig,
     pub instances: Vec<Instance>,
+}
+
+/// One Instance in a Project's resource report.
+pub struct InstanceResources {
+    pub instance: Instance,
+    pub shell_running: bool,
+    pub stats: ResourceStats,
 }
 
 #[derive(Default)]
@@ -556,10 +563,54 @@ impl Projects {
                     .map(PathBuf::from)
                     .filter(|p| p.is_dir())
             });
-        sandbox::shell_command(&instance, cwd.as_deref()).map_err(|_| {
-            "Docker container is not running for this terminal. Try closing and reopening it."
-                .to_string()
-        })
+        self.sandboxes
+            .for_instance(&instance)
+            .shell_command(&instance, cwd.as_deref())
+            .map_err(|e| e.to_string())
+    }
+
+    /// What the Instance is using now.
+    pub async fn instance_stats(&self, instance_id: &str) -> ProjectResult<ResourceStats> {
+        let instance = self.instance(instance_id).await?;
+        let pid = self
+            .terminals
+            .running_shells(&[instance_id])
+            .await
+            .remove(instance_id)
+            .flatten();
+        Ok(self
+            .sandboxes
+            .for_instance(&instance)
+            .stats(&instance, pid)
+            .await)
+    }
+
+    /// Each of the Project's Instances (oldest first), whether its shell is
+    /// running, and what it is using.
+    pub async fn resources(&self, project_id: &str) -> ProjectResult<Vec<InstanceResources>> {
+        self.project(project_id).await?;
+        let instances = self.instances_of(project_id).await;
+        let ids: Vec<&str> = instances.iter().map(|i| i.id.as_str()).collect();
+        let shells = self.terminals.running_shells(&ids).await;
+        let stats = futures::future::join_all(instances.iter().map(|i| {
+            let pid = shells.get(&i.id).copied().flatten();
+            self.sandboxes.for_instance(i).stats(i, pid)
+        }))
+        .await;
+        Ok(instances
+            .into_iter()
+            .zip(stats)
+            .map(|(instance, stats)| InstanceResources {
+                shell_running: shells.contains_key(&instance.id),
+                instance,
+                stats,
+            })
+            .collect())
+    }
+
+    /// Whether `mode` can be used right now.
+    pub async fn sandbox_health(&self, mode: SandboxMode) -> Result<(), SandboxError> {
+        self.sandboxes.for_mode(mode).health().await
     }
 
     /// Closes every Instance (on backend exit) and saves.

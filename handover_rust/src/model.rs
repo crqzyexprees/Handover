@@ -56,6 +56,15 @@ pub enum ProjectState {
     Suspended,
 }
 
+/// What an Instance is using right now; zeros when unknown.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ResourceStats {
+    pub mem_used_mb: f64,
+    /// 0 when nothing enforces a limit (native Instances).
+    pub mem_limit_mb: f64,
+    pub cpu_percent: f64,
+}
+
 /// Folder name used as a Project's display name.
 pub fn basename_from_path(path: &str) -> String {
     let normalized = path.replace('\\', "/").trim_end_matches('/').to_string();

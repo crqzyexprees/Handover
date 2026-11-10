@@ -13,8 +13,9 @@ use bollard::query_parameters::{
 };
 use bollard::Docker;
 use futures::StreamExt;
-use serde_json::json;
 use tempfile::TempDir;
+
+use crate::model::ResourceStats;
 
 pub const INSTANCE_LABEL: &str = "handover.instance_id";
 pub const BASE_IMAGE: &str = "handover-base:latest";
@@ -298,12 +299,8 @@ impl DockerRuntime {
         Ok(())
     }
 
-    pub async fn get_container_stats(&self, container_id: &str) -> serde_json::Value {
-        let zeros = json!({
-            "mem_used_mb": 0.0_f64,
-            "mem_limit_mb": 0.0_f64,
-            "cpu_percent": 0.0_f64,
-        });
+    pub async fn get_container_stats(&self, container_id: &str) -> ResourceStats {
+        let zeros = ResourceStats::default();
 
         let inspect = match self.docker.inspect_container(container_id, None).await {
             Ok(i) => i,
@@ -327,11 +324,11 @@ impl DockerRuntime {
             _ => return zeros,
         };
 
-        json!({
-            "mem_used_mb": mem_used_mb(&stats),
-            "mem_limit_mb": mem_limit_mb(&stats),
-            "cpu_percent": cpu_percent(&stats),
-        })
+        ResourceStats {
+            mem_used_mb: mem_used_mb(&stats),
+            mem_limit_mb: mem_limit_mb(&stats),
+            cpu_percent: cpu_percent(&stats),
+        }
     }
 
     pub async fn cleanup_orphans(&self) -> usize {

@@ -34,7 +34,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::docker::DockerRuntime;
 use crate::handoff_flow::{HandoffFailure, HandoffPlan, PromptSink};
-use crate::model::{HandoffMethod, Instance, ProjectConfig, SandboxMode, DEFAULT_MEM_LIMIT};
+use crate::model::{
+    HandoffMethod, Instance, ProjectConfig, ResourceStats, SandboxMode, DEFAULT_MEM_LIMIT,
+};
 use crate::projects::{ProjectError, ProjectView, Projects};
 use crate::pty::Terminals;
 use crate::sandbox::{DockerSandbox, NativeSandbox, SandboxError, Sandboxes};
@@ -80,8 +82,6 @@ impl Activity {
 struct ServerCtx {
     projects: Arc<Projects>,
     terminals: Arc<Terminals>,
-    sandboxes: Sandboxes,
-    docker: Arc<RwLock<Option<Arc<DockerRuntime>>>>,
     activity: Arc<Activity>,
     /// Notified to stop the server (see `/api/shutdown`).
     shutdown: Arc<tokio::sync::Notify>,
@@ -237,9 +237,9 @@ async fn track_activity(
 }
 
 async fn docker_health(State(ctx): State<ServerCtx>) -> Json<Value> {
-    match ctx.docker.read().await.as_ref() {
-        Some(d) if d.ping().await.is_ok() => Json(json!({ "status": "ok" })),
-        _ => Json(json!({
+    match ctx.projects.sandbox_health(SandboxMode::Docker).await {
+        Ok(()) => Json(json!({ "status": "ok" })),
+        Err(_) => Json(json!({
             "status": "error",
             "message": "Docker is not running or not installed."
         })),
@@ -380,24 +380,13 @@ async fn delete_instance(
 async fn instance_stats(
     State(ctx): State<ServerCtx>,
     Path(instance_id): Path<String>,
-) -> Result<Json<Value>, Response> {
-    let instance = ctx
+) -> Result<Json<ResourceStats>, Response> {
+    let stats = ctx
         .projects
-        .instance(&instance_id)
+        .instance_stats(&instance_id)
         .await
         .map_err(project_err)?;
-    let pid = ctx
-        .terminals
-        .running_shells(&[instance_id.as_str()])
-        .await
-        .remove(&instance_id)
-        .flatten();
-    Ok(Json(
-        ctx.sandboxes
-            .for_instance(&instance)
-            .stats(&instance, pid)
-            .await,
-    ))
+    Ok(Json(stats))
 }
 
 async fn focus_instance(
@@ -641,28 +630,21 @@ async fn project_resources(
         0.0
     };
 
-    let instances = ctx.projects.instances_of(&project_id).await;
-    // A shell can be running with no window attached; it still counts.
-    let ids: Vec<&str> = instances.iter().map(|i| i.id.as_str()).collect();
-    let shells = ctx.terminals.running_shells(&ids).await;
-    let stats = futures::future::join_all(instances.iter().map(|i| {
-        let pid = shells.get(&i.id).copied().flatten();
-        ctx.sandboxes.for_instance(i).stats(i, pid)
-    }))
-    .await;
-
-    let rows: Vec<Value> = instances
-        .iter()
-        .zip(stats)
+    let rows: Vec<Value> = ctx
+        .projects
+        .resources(&project_id)
+        .await
+        .map_err(project_err)?
+        .into_iter()
         .enumerate()
-        .map(|(index, (i, stats))| {
+        .map(|(index, r)| {
             json!({
-                "instance_id": i.id,
+                "instance_id": r.instance.id,
                 "label": format!("Terminal {}", index + 1),
-                "sandbox_mode": i.sandbox_mode,
+                "sandbox_mode": r.instance.sandbox_mode,
                 // True while the shell is running, attached window or not.
-                "connected": shells.contains_key(&i.id),
-                "stats": stats,
+                "connected": r.shell_running,
+                "stats": r.stats,
             })
         })
         .collect();
@@ -791,15 +773,12 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(DockerSandbox::new(docker_slot.clone())),
     );
     let terminals = Terminals::new();
-    let projects =
-        Projects::load(state::default_path(), sandboxes.clone(), terminals.clone()).await;
+    let projects = Projects::load(state::default_path(), sandboxes, terminals.clone()).await;
     governor::spawn_governor(projects.clone());
 
     let ctx = ServerCtx {
         projects,
         terminals,
-        sandboxes,
-        docker: docker_slot,
         activity: Arc::new(Activity::default()),
         shutdown: Arc::new(tokio::sync::Notify::new()),
     };
@@ -896,17 +875,11 @@ mod tests {
         let docker = Arc::new(docker);
         let sandboxes = Sandboxes::new(Arc::new(NativeSandbox), docker.clone());
         let terminals = Terminals::new();
-        let projects = Projects::load(
-            dir.path().join("state.json"),
-            sandboxes.clone(),
-            terminals.clone(),
-        )
-        .await;
+        let projects =
+            Projects::load(dir.path().join("state.json"), sandboxes, terminals.clone()).await;
         let ctx = ServerCtx {
             projects,
             terminals,
-            sandboxes,
-            docker: Arc::new(RwLock::new(None)),
             activity: Arc::new(Activity::default()),
             shutdown: Arc::new(tokio::sync::Notify::new()),
         };

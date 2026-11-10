@@ -1,20 +1,20 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use crate::model::ResourceStats;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
 
 /// Memory + CPU for a shell process and its descendants (native / docker-exec PTY children).
-pub fn process_tree_stats(root_pid: u32) -> Value {
+pub fn process_tree_stats(root_pid: u32) -> ResourceStats {
     process_tree_stats_batch(&[root_pid])
         .into_iter()
         .next()
         .map(|(_, stats)| stats)
-        .unwrap_or_else(zeros)
+        .unwrap_or_default()
 }
 
 /// Sample many process trees with a single CPU refresh cycle.
-pub fn process_tree_stats_batch(root_pids: &[u32]) -> Vec<(u32, Value)> {
+pub fn process_tree_stats_batch(root_pids: &[u32]) -> Vec<(u32, ResourceStats)> {
     if root_pids.is_empty() {
         return Vec::new();
     }
@@ -27,7 +27,10 @@ pub fn process_tree_stats_batch(root_pids: &[u32]) -> Vec<(u32, Value)> {
                 .with_cmd(UpdateKind::OnlyIfNotSet),
         ),
     ) else {
-        return root_pids.iter().map(|&pid| (pid, zeros())).collect();
+        return root_pids
+            .iter()
+            .map(|&pid| (pid, ResourceStats::default()))
+            .collect();
     };
 
     // First sample seeds CPU counters; second sample yields usable percentages.
@@ -42,18 +45,10 @@ pub fn process_tree_stats_batch(root_pids: &[u32]) -> Vec<(u32, Value)> {
         .collect()
 }
 
-pub fn zeros() -> Value {
-    json!({
-        "mem_used_mb": 0.0,
-        "mem_limit_mb": 0.0,
-        "cpu_percent": 0.0,
-    })
-}
-
-fn stats_for_root(sys: &System, root_pid: u32) -> Value {
+fn stats_for_root(sys: &System, root_pid: u32) -> ResourceStats {
     let root = Pid::from_u32(root_pid);
     if sys.process(root).is_none() {
-        return zeros();
+        return ResourceStats::default();
     }
 
     let tree = collect_tree(sys, root);
@@ -69,11 +64,11 @@ fn stats_for_root(sys: &System, root_pid: u32) -> Value {
     let mem_used_mb = ((mem_bytes as f64 / (1024.0 * 1024.0)) * 10.0).round() / 10.0;
     let cpu_percent = (cpu_percent * 10.0).round() / 10.0;
 
-    json!({
-        "mem_used_mb": mem_used_mb,
-        "mem_limit_mb": 0.0,
-        "cpu_percent": cpu_percent,
-    })
+    ResourceStats {
+        mem_used_mb,
+        mem_limit_mb: 0.0,
+        cpu_percent,
+    }
 }
 
 fn collect_tree(sys: &System, root: Pid) -> Vec<Pid> {
@@ -100,10 +95,9 @@ mod tests {
     fn current_process_reports_nonzero_memory() {
         let pid = std::process::id();
         let stats = process_tree_stats(pid);
-        let mem = stats
-            .get("mem_used_mb")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        assert!(mem > 0.0, "expected memory for pid {pid}, got {stats}");
+        assert!(
+            stats.mem_used_mb > 0.0,
+            "expected memory for pid {pid}, got {stats:?}"
+        );
     }
 }
