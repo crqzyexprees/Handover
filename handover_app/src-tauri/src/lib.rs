@@ -3,8 +3,9 @@
 //!
 //! The backend outlives the window so running shells and containers survive
 //! an app quit: on quit we ask it to stop only if nothing in it is busy.
-//! Its port and token are kept in a private runtime file (`backend.json` in the app's local data
-//! dir); the next launch reuses that backend, and its terminals re-attach.
+//! Its port and token are kept in a private runtime file (`backend.json` in
+//! the app's local data dir); the next launch reuses that backend, and its
+//! terminals re-attach.
 //! While the app is open it sends a heartbeat; a backend left behind exits
 //! by itself after `IDLE_EXIT_SECS` with nothing busy and no requests.
 

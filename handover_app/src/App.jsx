@@ -1,11 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import * as api from './api.js'
+import { getProjectDisplayName } from './projectUtils.js'
 import {
-  getInstanceId,
-  getProjectDisplayName,
-  getProjectId,
-  getProjectInstances,
-} from './projectUtils.js'
+  allInstances as listAllInstances,
+  findProject,
+  initialProjectState,
+  projectActions,
+  projectReducer,
+} from './projectStore.js'
 import HandoverModal from './HandoverModal.jsx'
 import HandoffHistoryPanel from './HandoffHistoryPanel.jsx'
 import BroadcastModal from './BroadcastModal.jsx'
@@ -16,28 +18,14 @@ import TabBar from './TabBar.jsx'
 import TerminalView from './TerminalView.jsx'
 import TitleBar from './TitleBar.jsx'
 
-const DEFAULT_PROJECT_CONFIG = {
-  project_name: '',
-  sandbox_mode: 'docker',
-  mem_limit: '2g',
-  handoff_method: 'summary',
-  handoff_template: 'generic',
-  custom_env_vars: {},
-}
-
+/** Error text from a failed request (`request()` in api.js). */
 function formatApiError(error) {
   if (error == null) return 'Unknown error'
   if (typeof error === 'string') return error
   if (typeof error !== 'object') return 'Request failed'
   if (typeof error.detail === 'string') return error.detail
-  if (Array.isArray(error.detail)) {
-    return error.detail
-      .map((d) => (typeof d === 'object' && d?.msg ? d.msg : String(d)))
-      .join('; ')
-  }
   if (error.message) return String(error.message)
   if (error.httpStatus) return `Request failed (${error.httpStatus})`
-  if (typeof error.status === 'number') return `Request failed (${error.status})`
   return 'Request failed'
 }
 
@@ -66,9 +54,8 @@ function ToastStack({ toasts }) {
 }
 
 export default function App() {
-  const [projects, setProjects] = useState([])
-  const [focusedProjectId, setFocusedProjectId] = useState(null)
-  const [focusedInstanceId, setFocusedInstanceId] = useState(null)
+  const [store, dispatch] = useReducer(projectReducer, initialProjectState)
+  const { projects, focusedProjectId, focusedInstanceId } = store
   const [toasts, setToasts] = useState([])
   const [handoverOpen, setHandoverOpen] = useState(false)
   const [handoffHistoryOpen, setHandoffHistoryOpen] = useState(false)
@@ -91,66 +78,32 @@ export default function App() {
   }, [])
 
   const handlePtyConnectionChange = useCallback((instanceId, status) => {
-    const id = String(instanceId ?? '')
-    if (id === '') return
+    if (!instanceId) return
     setPtyConnections((prev) => {
-      if (prev[id] === status) return prev
-      return { ...prev, [id]: status }
+      if (prev[instanceId] === status) return prev
+      return { ...prev, [instanceId]: status }
     })
   }, [])
 
+  /** Reloads every Project; returns the list, or null on failure. */
   const refreshProjects = useCallback(async () => {
     const { data, error } = await api.listProjects()
     if (error) {
       pushToast(`Could not load projects: ${formatApiError(error)}`, 'error')
       return null
     }
-    if (data != null) {
-      const incoming = Array.isArray(data) ? data : []
-      let merged = incoming
-      setProjects((prev) => {
-        const prevById = new Map(
-          prev.map((project) => [String(getProjectId(project) ?? ''), project]),
-        )
-        merged = incoming.map((project) => {
-          const id = String(getProjectId(project) ?? '')
-          const previous = prevById.get(id)
-          const hasInstancesFromApi =
-            Array.isArray(project.instances) || Array.isArray(project.instance_list)
-          const hasConfigFromApi =
-            project?.config && typeof project.config === 'object'
-          if ((hasInstancesFromApi && hasConfigFromApi) || !previous) {
-            return project
-          }
-          const preserved = getProjectInstances(previous)
-          const nextProject = preserved.length > 0
-            ? { ...project, instances: preserved }
-            : project
-          if (!hasConfigFromApi && previous?.config) {
-            return {
-              ...nextProject,
-              config: previous.config,
-            }
-          }
-          return nextProject
-        })
-        return merged
-      })
-      if (!restoreToastShownRef.current && incoming.length > 0) {
-        restoreToastShownRef.current = true
-        const runningTerminals = incoming.some(
-          (project) => getProjectInstances(project).length > 0,
-        )
-        pushToast(
-          runningTerminals
-            ? 'Projects restored; terminals that kept running are reattached.'
-            : 'Projects restored from your last session. Open a terminal to continue.',
-          'info',
-        )
-      }
-      return merged
+    dispatch(projectActions.loaded(data))
+    if (!restoreToastShownRef.current && data.length > 0) {
+      restoreToastShownRef.current = true
+      const runningTerminals = data.some((project) => project.instances.length > 0)
+      pushToast(
+        runningTerminals
+          ? 'Projects restored; terminals that kept running are reattached.'
+          : 'Projects restored from your last session. Open a terminal to continue.',
+        'info',
+      )
     }
-    return null
+    return data
   }, [pushToast])
 
   useEffect(() => {
@@ -160,25 +113,11 @@ export default function App() {
     return () => window.clearTimeout(timer)
   }, [refreshProjects])
 
-  const focusedProject = useMemo(() => {
-    return projects.find(
-      (p) => String(getProjectId(p)) === String(focusedProjectId ?? ''),
-    )
-  }, [projects, focusedProjectId])
-
-  const allInstances = useMemo(() => {
-    const seen = new Set()
-    const instances = []
-    for (const project of projects) {
-      for (const instance of getProjectInstances(project)) {
-        const instanceId = String(getInstanceId(instance) ?? '')
-        if (instanceId === '' || seen.has(instanceId)) continue
-        seen.add(instanceId)
-        instances.push({ instance_id: instanceId })
-      }
-    }
-    return instances
-  }, [projects])
+  const focusedProject = useMemo(
+    () => findProject(store, focusedProjectId),
+    [store, focusedProjectId],
+  )
+  const allInstances = useMemo(() => listAllInstances(store), [store])
 
   const startInstanceForProject = useCallback(async (projectId, sandboxMode) => {
     if (projectId == null) {
@@ -190,42 +129,8 @@ export default function App() {
       pushToast(`Could not start terminal: ${formatApiError(error)}`, 'error')
       return null
     }
-    if (data == null) {
-      pushToast('Could not start terminal: empty response from server', 'error')
-      return null
-    }
-
-    const newInstanceId =
-      data?.instance_id ?? data?.id ?? data?.instanceId ?? null
-    if (newInstanceId == null) {
-      pushToast('Could not start terminal: server did not return an instance id', 'error')
-      return null
-    }
-
-    const normalizedId = String(newInstanceId)
-    const newInstance =
-      data?.instance && typeof data.instance === 'object'
-        ? { ...data.instance, instance_id: data.instance.instance_id ?? normalizedId }
-        : { ...data, instance_id: normalizedId }
-
-    setProjects((prev) =>
-      prev.map((project) => {
-        if (String(getProjectId(project)) !== String(projectId)) {
-          return project
-        }
-        const existing = Array.isArray(project.instances) ? project.instances : []
-        if (existing.some((instance) => String(getInstanceId(instance) ?? '') === normalizedId)) {
-          return project
-        }
-        return {
-          ...project,
-          instances: [...existing, newInstance],
-        }
-      }),
-    )
-
-    setFocusedInstanceId(normalizedId)
-    return normalizedId
+    dispatch(projectActions.instanceOpened(data))
+    return data.id
   }, [pushToast])
 
   const handleStartInstance = useCallback(
@@ -233,110 +138,32 @@ export default function App() {
     [focusedProjectId, startInstanceForProject],
   )
 
-  const handleSelectProject = useCallback(async (id) => {
-    const projectId = String(id)
-    const localProjectBeforeSelect = projects.find(
-      (p) => String(getProjectId(p)) === projectId,
-    )
-    const localInstancesBeforeSelect = getProjectInstances(localProjectBeforeSelect)
-
-    const { error } = await api.activateProject(id)
+  const handleSelectProject = useCallback(async (projectId) => {
+    const { error } = await api.activateProject(projectId)
     if (error) {
       pushToast(`Could not activate project: ${formatApiError(error)}`, 'error')
       return
     }
-    setFocusedProjectId(projectId)
     const refreshed = await refreshProjects()
-    const { data: configData } = await api.getProjectConfig(projectId)
-    if (configData && typeof configData === 'object') {
-      setProjects((prev) =>
-        prev.map((project) =>
-          String(getProjectId(project) ?? '') === projectId
-            ? { ...project, config: configData }
-            : project,
-        ),
-      )
-    }
-    const selectedProject = refreshed?.find(
-      (p) => String(getProjectId(p)) === projectId,
-    )
-    const instances = getProjectInstances(selectedProject)
-    const shouldAutoStart =
-      instances.length === 0 && localInstancesBeforeSelect.length === 0
-    if (shouldAutoStart) {
+    const selected = refreshed?.find((p) => p.id === projectId)
+    if (!selected) return
+    dispatch(projectActions.projectFocused(projectId))
+    if (selected.instances.length === 0) {
       await startInstanceForProject(projectId)
-    } else {
-      const sourceInstances =
-        instances.length > 0 ? instances : localInstancesBeforeSelect
-      const firstId = getInstanceId(sourceInstances[0])
-      setFocusedInstanceId(firstId != null ? String(firstId) : null)
     }
-  }, [projects, pushToast, refreshProjects, startInstanceForProject])
+  }, [pushToast, refreshProjects, startInstanceForProject])
 
   const handleAddProject = useCallback(
-    async (path, sandboxMode = DEFAULT_PROJECT_CONFIG.sandbox_mode) => {
+    async (path, sandboxMode) => {
       const { data, error } = await api.createProject(path, sandboxMode)
       if (error) {
         pushToast(`Could not create project: ${formatApiError(error)}`, 'error')
         return
       }
-
-      const newId =
-        data?.id ?? data?.project_id ?? data?.projectId ?? null
-
-      if (newId != null) {
-        const pid = String(newId)
-        const initialConfig = {
-          ...DEFAULT_PROJECT_CONFIG,
-          project_name: data?.name ?? '',
-          sandbox_mode: sandboxMode,
-          ...(data?.config && typeof data.config === 'object' ? data.config : {}),
-        }
-        setProjects((prev) => {
-          const exists = prev.some((p) => String(getProjectId(p) ?? '') === pid)
-          const entry = {
-            ...(data && typeof data === 'object' ? data : {}),
-            id: pid,
-            path,
-            name: data?.name,
-            sandbox_mode: sandboxMode,
-            config: initialConfig,
-            instances: [],
-          }
-          return exists
-            ? prev.map((p) =>
-                String(getProjectId(p) ?? '') === pid
-                  ? { ...p, ...entry, instances: getProjectInstances(p) }
-                  : p,
-              )
-            : [...prev, entry]
-        })
-      }
-
-      const updated = await refreshProjects()
-
-      const resolvedId =
-        newId ??
-        updated?.find((p) => (p.path ?? p.project_path) === path)?.id ??
-        updated?.find((p) => (p.path ?? p.project_path) === path)?.project_id
-
-      if (resolvedId != null) {
-        setProjects((prev) =>
-          prev.map((project) => {
-            if (String(getProjectId(project) ?? '') !== String(resolvedId)) {
-              return project
-            }
-            const config =
-              project.config && typeof project.config === 'object'
-                ? { ...project.config, sandbox_mode: sandboxMode }
-                : { ...DEFAULT_PROJECT_CONFIG, sandbox_mode: sandboxMode }
-            return { ...project, sandbox_mode: sandboxMode, config }
-          }),
-        )
-        await handleSelectProject(String(resolvedId))
-      }
+      dispatch(projectActions.projectAdded(data))
+      await handleSelectProject(data.id)
     },
-    [handleSelectProject, pushToast, refreshProjects],
+    [handleSelectProject, pushToast],
   )
 
   const handleFocusInstance = useCallback(async (id) => {
@@ -345,22 +172,19 @@ export default function App() {
       pushToast(`Could not focus terminal: ${formatApiError(error)}`, 'error')
       return
     }
-    setFocusedInstanceId(String(id))
+    dispatch(projectActions.instanceFocused(id))
   }, [pushToast])
 
   const handleSidebarSelectInstance = useCallback(
     async (projectId, instanceId) => {
-      const pid = String(projectId)
-      const iid = String(instanceId)
-      if (String(focusedProjectId ?? '') !== pid) {
-        const { error } = await api.activateProject(pid)
+      if (focusedProjectId !== projectId) {
+        const { error } = await api.activateProject(projectId)
         if (error) {
           pushToast(`Could not activate project: ${formatApiError(error)}`, 'error')
           return
         }
-        setFocusedProjectId(pid)
       }
-      await handleFocusInstance(iid)
+      await handleFocusInstance(instanceId)
     },
     [focusedProjectId, handleFocusInstance, pushToast],
   )
@@ -372,78 +196,23 @@ export default function App() {
         pushToast(`Could not unload project: ${formatApiError(error)}`, 'error')
         return
       }
-
-      setProjects((prev) =>
-        prev.filter((project) => String(getProjectId(project)) !== String(projectId)),
-      )
-
-      if (String(focusedProjectId ?? '') === String(projectId)) {
-        setFocusedProjectId(null)
-        setFocusedInstanceId(null)
+      if (focusedProjectId === projectId) {
         setHandoverOpen(false)
       }
+      dispatch(projectActions.projectClosed(projectId))
     },
     [focusedProjectId, pushToast],
   )
 
-  const handleStopInstance = useCallback(
-    (instanceId) => {
-      const targetId = String(instanceId ?? '')
-      if (targetId === '') return
-
-      setProjects((prev) => {
-        let removedFromFocused = false
-        let nextFocusedId = null
-        const nextProjects = prev.map((project) => {
-          const existing = getProjectInstances(project)
-          const removeIndex = existing.findIndex(
-            (inst) =>
-              String(
-                inst?.instance_id ?? inst?.id ?? inst?.instanceId ?? '',
-              ) === targetId,
-          )
-          if (removeIndex < 0) return project
-
-          const nextInstances = existing.filter((_, idx) => idx !== removeIndex)
-          const projectId = String(getProjectId(project) ?? '')
-          if (projectId === String(focusedProjectId ?? '')) {
-            removedFromFocused = true
-            if (String(focusedInstanceId ?? '') === targetId) {
-              const nextFocus =
-                nextInstances[removeIndex] ?? nextInstances[removeIndex - 1] ?? null
-              const nextId = nextFocus
-                ? String(
-                    nextFocus?.instance_id ?? nextFocus?.id ?? nextFocus?.instanceId ?? '',
-                  )
-                : ''
-              nextFocusedId = nextId !== '' ? nextId : null
-            } else {
-              nextFocusedId =
-                focusedInstanceId != null ? String(focusedInstanceId) : null
-            }
-          }
-
-          return {
-            ...project,
-            instances: nextInstances,
-          }
-        })
-
-        if (removedFromFocused) {
-          setFocusedInstanceId(nextFocusedId)
-        }
-
-        return nextProjects
-      })
-
-      void api.stopInstance(targetId).then(({ error }) => {
-        if (error) {
-          console.error(`Could not stop terminal ${targetId}:`, error)
-        }
-      })
-    },
-    [focusedInstanceId, focusedProjectId],
-  )
+  const handleStopInstance = useCallback((instanceId) => {
+    if (!instanceId) return
+    dispatch(projectActions.instanceClosed(instanceId))
+    void api.stopInstance(instanceId).then(({ error }) => {
+      if (error) {
+        console.error(`Could not stop terminal ${instanceId}:`, error)
+      }
+    })
+  }, [])
 
   const handleExecuteHandover = useCallback(
     async (payload) => {
@@ -460,38 +229,17 @@ export default function App() {
   )
 
   const handleOpenProjectSettings = useCallback((projectId) => {
-    setSettingsProjectId(String(projectId))
+    setSettingsProjectId(projectId)
     setIsSettingsModalOpen(true)
   }, [])
 
+  /** `config` is what the backend saved (and will use). */
   const handleSaveProjectConfig = useCallback((projectId, config) => {
-    const displayName = config?.project_name?.trim() ?? ''
-    const normalizedConfig = {
-      project_name: displayName,
-      sandbox_mode: config?.sandbox_mode ?? DEFAULT_PROJECT_CONFIG.sandbox_mode,
-      mem_limit: config?.mem_limit ?? DEFAULT_PROJECT_CONFIG.mem_limit,
-      handoff_method: config?.handoff_method ?? DEFAULT_PROJECT_CONFIG.handoff_method,
-      handoff_template:
-        config?.handoff_template ?? DEFAULT_PROJECT_CONFIG.handoff_template,
-      custom_env_vars:
-        config?.custom_env_vars && typeof config.custom_env_vars === 'object'
-          ? config.custom_env_vars
-          : DEFAULT_PROJECT_CONFIG.custom_env_vars,
-    }
-
-    setProjects((prev) =>
-      prev.map((project) =>
-        String(getProjectId(project) ?? '') === String(projectId ?? '')
-          ? {
-              ...project,
-              name: displayName || project.name,
-              config: normalizedConfig,
-            }
-          : project,
-      ),
-    )
+    dispatch(projectActions.configSaved(projectId, config))
     pushToast('Project settings saved', 'info')
   }, [pushToast])
+
+  const settingsProject = findProject(store, settingsProjectId)
 
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col bg-[#1e1e1e] text-[#cccccc]">
@@ -555,18 +303,14 @@ export default function App() {
           ) : null}
           {/* Keep every instance mounted (native + docker) so tab switches
               do not dispose xterm or close the PTY WebSocket. */}
-          {allInstances.map((instance) => {
-            const instanceId = String(instance.instance_id ?? '')
-            if (!instanceId) return null
-            return (
-              <TerminalView
-                key={instanceId}
-                instanceId={instanceId}
-                isActive={instanceId === String(focusedInstanceId ?? '')}
-                onConnectionChange={handlePtyConnectionChange}
-              />
-            )
-          })}
+          {allInstances.map((instance) => (
+            <TerminalView
+              key={instance.id}
+              instanceId={instance.id}
+              isActive={instance.id === focusedInstanceId}
+              onConnectionChange={handlePtyConnectionChange}
+            />
+          ))}
         </div>
         </div>
       </div>
@@ -574,12 +318,9 @@ export default function App() {
         key={`${focusedProjectId ?? 'none'}-${handoverOpen ? 'open' : 'closed'}`}
         open={handoverOpen}
         projectId={focusedProjectId}
-        instances={getProjectInstances(focusedProject)}
+        instances={focusedProject?.instances ?? []}
         ptyConnections={ptyConnections}
-        defaultMethod={
-          focusedProject?.config?.handoff_method ??
-          DEFAULT_PROJECT_CONFIG.handoff_method
-        }
+        defaultMethod={focusedProject?.config.handoff_method}
         onClose={() => setHandoverOpen(false)}
         onExecute={handleExecuteHandover}
       />
@@ -598,21 +339,20 @@ export default function App() {
         key={`broadcast-${focusedProjectId ?? 'none'}-${broadcastOpen ? 'open' : 'closed'}`}
         open={broadcastOpen}
         projectId={focusedProjectId}
-        instances={getProjectInstances(focusedProject)}
+        instances={focusedProject?.instances ?? []}
         ptyConnections={ptyConnections}
         onClose={() => setBroadcastOpen(false)}
       />
-      <ProjectSettings
-        isOpen={isSettingsModalOpen}
-        onClose={() => setIsSettingsModalOpen(false)}
-        focusedProjectId={settingsProjectId}
-        defaultProjectName={getProjectDisplayName(
-          projects.find(
-            (p) => String(getProjectId(p) ?? '') === String(settingsProjectId ?? ''),
-          ),
-        )}
-        onSaveConfig={handleSaveProjectConfig}
-      />
+      {isSettingsModalOpen && settingsProject ? (
+        <ProjectSettings
+          key={settingsProject.id}
+          isOpen
+          onClose={() => setIsSettingsModalOpen(false)}
+          focusedProjectId={settingsProject.id}
+          initialConfig={settingsProject.config}
+          onSaveConfig={handleSaveProjectConfig}
+        />
+      ) : null}
       <ToastStack toasts={toasts} />
     </div>
   )

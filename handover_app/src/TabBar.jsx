@@ -1,5 +1,4 @@
 import { useState } from 'react'
-import { getInstanceId } from './projectUtils.js'
 
 function ConnectionDot({ status }) {
   const color =
@@ -36,11 +35,7 @@ export default function TabBar({
 }) {
   const [showCreateMenu, setShowCreateMenu] = useState(false)
 
-  const instances = Array.isArray(focusedProject?.instances)
-    ? focusedProject.instances
-    : Array.isArray(focusedProject?.instance_list)
-      ? focusedProject.instance_list
-      : []
+  const instances = focusedProject?.instances ?? []
 
   const handleStart = async (sandboxMode) => {
     if (!focusedProject) return
@@ -52,21 +47,20 @@ export default function TabBar({
     <header className="relative box-border flex h-10 min-h-10 shrink-0 items-stretch gap-1 overflow-visible border-b border-[#333333] bg-[#252526] px-1 text-xs text-[#cccccc]">
       <div className="flex min-w-0 flex-1 items-stretch gap-1 overflow-x-auto">
         {instances.map((instance, index) => {
-          const id = getInstanceId(instance)
-          const sid = id != null ? String(id) : ''
-          const selected = sid !== '' && sid === String(focusedInstanceId ?? '')
+          const sid = instance.id
+          const selected = sid === focusedInstanceId
           const connStatus = ptyConnections[sid]
 
           return (
             <div
-              key={sid || JSON.stringify(instance)}
+              key={sid}
               className={`group flex shrink-0 items-stretch overflow-hidden rounded-sm border border-[#333333] ${
                 selected ? 'bg-[#37373d]' : 'bg-[#252526] hover:bg-[#2a2d2e]'
               }`}
             >
               <button
                 type="button"
-                onClick={() => sid !== '' && onFocusInstance(sid)}
+                onClick={() => onFocusInstance(sid)}
                 className={`flex max-w-[160px] min-w-0 items-center gap-1.5 border-b px-2 py-1 text-left font-medium ${
                   selected
                     ? 'border-[#3794ff] text-[#cccccc]'
@@ -79,7 +73,7 @@ export default function TabBar({
               <button
                 type="button"
                 title="Close terminal"
-                onClick={() => sid !== '' && onStopInstance(sid)}
+                onClick={() => onStopInstance(sid)}
                 className="flex w-6 shrink-0 items-center justify-center text-[11px] text-[#808080] opacity-0 transition-opacity hover:bg-[#2a2d2e] hover:text-[#cccccc] group-hover:opacity-100"
               >
                 ×

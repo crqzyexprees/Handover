@@ -1,5 +1,4 @@
 import { useMemo, useState } from 'react'
-import { getInstanceId } from './projectUtils.js'
 import * as api from './api.js'
 
 export default function BroadcastModal({
@@ -15,15 +14,7 @@ export default function BroadcastModal({
   const [errorText, setErrorText] = useState('')
 
   const instanceList = useMemo(
-    () =>
-      (Array.isArray(instances) ? instances : [])
-        .map((instance, index) => {
-          const id = getInstanceId(instance)
-          return id == null
-            ? null
-            : { id: String(id), label: `Terminal ${index + 1}` }
-        })
-        .filter(Boolean),
+    () => instances.map((instance, index) => ({ id: instance.id, label: `Terminal ${index + 1}` })),
     [instances],
   )
 

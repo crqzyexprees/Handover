@@ -1,12 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import * as api from './api.js'
 
-const DEFAULT_CONFIG = {
-  project_name: '',
-  sandbox_mode: 'docker',
-  mem_limit: '2g',
-  handoff_method: 'summary',
-  handoff_template: 'generic',
+/** The form's fields, from a config the backend sent. */
+function formFromConfig(config) {
+  return {
+    project_name: config.project_name,
+    sandbox_mode: config.sandbox_mode,
+    mem_limit: config.mem_limit,
+    handoff_method: config.handoff_method,
+    handoff_template: config.handoff_template,
+  }
 }
 
 const HANDOFF_TEMPLATES = [
@@ -92,11 +95,15 @@ export default function ProjectSettings({
   isOpen,
   onClose,
   focusedProjectId,
-  defaultProjectName = '',
+  initialConfig,
   onSaveConfig,
 }) {
-  const [config, setConfig] = useState(DEFAULT_CONFIG)
-  const [customEnvVars, setCustomEnvVars] = useState(defaultCustomEnvVars)
+  // Mounted per open (see App), so the project's config seeds the form;
+  // a fresh read below picks up hand edits to `.handover/config.yml`.
+  const [config, setConfig] = useState(() => formFromConfig(initialConfig))
+  const [customEnvVars, setCustomEnvVars] = useState(() =>
+    dictToCustomEnvVars(initialConfig.custom_env_vars),
+  )
   const [isSaving, setIsSaving] = useState(false)
   const [errorText, setErrorText] = useState('')
 
@@ -112,38 +119,21 @@ export default function ProjectSettings({
   }, [config.mem_limit, config.sandbox_mode, systemRamGb])
 
   useEffect(() => {
-    if (!isOpen || focusedProjectId == null) return
-
+    if (focusedProjectId == null) return
     let ignore = false
-
     void api.getProjectConfig(focusedProjectId).then(({ data, error }) => {
       if (ignore) return
-
-      const fallbackName = defaultProjectName.trim() || ''
       if (error) {
-        if (error?.httpStatus === 404 || error?.status === 404) {
-          setConfig({ ...DEFAULT_CONFIG, project_name: fallbackName })
-        } else {
-          setErrorText('Could not load project settings. Using defaults.')
-          setConfig({ ...DEFAULT_CONFIG, project_name: fallbackName })
-        }
-        setCustomEnvVars(defaultCustomEnvVars())
-      } else {
-        setConfig({
-          project_name: data?.project_name?.trim() || fallbackName,
-          sandbox_mode: data?.sandbox_mode ?? DEFAULT_CONFIG.sandbox_mode,
-          mem_limit: data?.mem_limit ?? DEFAULT_CONFIG.mem_limit,
-          handoff_method: data?.handoff_method ?? DEFAULT_CONFIG.handoff_method,
-          handoff_template: data?.handoff_template ?? DEFAULT_CONFIG.handoff_template,
-        })
-        setCustomEnvVars(dictToCustomEnvVars(data?.custom_env_vars))
+        setErrorText('Could not load the latest project settings.')
+        return
       }
+      setConfig(formFromConfig(data))
+      setCustomEnvVars(dictToCustomEnvVars(data.custom_env_vars))
     })
-
     return () => {
       ignore = true
     }
-  }, [defaultProjectName, focusedProjectId, isOpen])
+  }, [focusedProjectId])
 
   if (!isOpen) return null
 
@@ -178,15 +168,17 @@ export default function ProjectSettings({
       project_name: config.project_name.trim(),
       custom_env_vars,
     }
-    const { error } = await api.saveProjectConfig(focusedProjectId, payload)
+    const { data: saved, error } = await api.saveProjectConfig(focusedProjectId, payload)
     setIsSaving(false)
     if (error) {
-      setErrorText('Could not save project settings.')
+      setErrorText(
+        typeof error.detail === 'string'
+          ? `Could not save project settings: ${error.detail}`
+          : 'Could not save project settings.',
+      )
       return
     }
-    if (typeof onSaveConfig === 'function') {
-      onSaveConfig(focusedProjectId, payload)
-    }
+    onSaveConfig?.(focusedProjectId, saved)
     window.setTimeout(() => {
       onClose()
     }, 250)

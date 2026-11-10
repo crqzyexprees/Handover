@@ -1,5 +1,4 @@
 import { useMemo, useState } from 'react'
-import { getInstanceId } from './projectUtils.js'
 
 const METHOD_HELP = {
   git: 'Team checkpoint: commits code changes, then prompts the receiving terminal. Use when switching teams on the same repo. Requires only the receiving terminal to be connected.',
@@ -28,18 +27,7 @@ export default function HandoverModal({
   onExecute,
 }) {
   const instanceOptions = useMemo(
-    () =>
-      (Array.isArray(instances) ? instances : [])
-        .map((instance, index) => {
-          const id = getInstanceId(instance)
-          return id == null
-            ? null
-            : {
-                id: String(id),
-                label: `Terminal ${index + 1}`,
-              }
-        })
-        .filter(Boolean),
+    () => instances.map((instance, index) => ({ id: instance.id, label: `Terminal ${index + 1}` })),
     [instances],
   )
 

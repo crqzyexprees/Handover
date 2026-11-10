@@ -1,13 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { pickDirectory } from './platform.js'
-import {
-  getInstanceId,
-  getProjectConfig,
-  getProjectDisplayName,
-  getProjectId,
-  getProjectInstances,
-  getTerminalSidebarLabel,
-} from './projectUtils.js'
+import { getProjectDisplayName, getTerminalSidebarLabel } from './projectUtils.js'
 
 function IconButton({ title, onClick, disabled, children }) {
   return (
@@ -235,15 +228,13 @@ export default function Sidebar({
           <p className="px-2 py-1 text-xs text-[#555555]">No projects yet</p>
         ) : (
           filteredProjects.map((project) => {
-            const id = getProjectId(project)
-            const pid = id != null ? String(id) : ''
+            const pid = project.id
             const title = getProjectDisplayName(project)
-            const instances = getProjectInstances(project)
+            const instances = project.instances
             const projectSelected =
               pid !== '' && pid === String(focusedProjectId ?? '')
             const isCollapsed = collapsedProjects.has(pid)
-            const config = getProjectConfig(project)
-            const defaultSandbox = config?.sandbox_mode ?? 'docker'
+            const defaultSandbox = project.config.sandbox_mode
             const sandboxLabel =
               defaultSandbox === 'native' ? 'Native' : 'Docker'
 
@@ -305,27 +296,15 @@ export default function Sidebar({
                   ) : (
                     <ul className="mt-0.5 space-y-0.5">
                       {instances.map((instance, index) => {
-                        const instanceId = getInstanceId(instance)
-                        const sid =
-                          instanceId != null ? String(instanceId) : ''
-                        const selected =
-                          sid !== '' &&
-                          sid === String(focusedInstanceId ?? '')
-                        const label = getTerminalSidebarLabel(
-                          project,
-                          instance,
-                          index,
-                        )
+                        const sid = instance.id
+                        const selected = sid === focusedInstanceId
+                        const label = getTerminalSidebarLabel(instance, index)
 
                         return (
-                          <li key={sid || `inst-${index}`}>
+                          <li key={sid}>
                             <button
                               type="button"
-                              onClick={() =>
-                                pid !== '' &&
-                                sid !== '' &&
-                                onSelectInstance(pid, sid)
-                              }
+                              onClick={() => onSelectInstance(pid, sid)}
                               className={`flex w-full items-center gap-2 rounded-md py-1 pr-2 pl-5 text-left text-[13px] ${
                                 selected
                                   ? 'bg-[#2a2d2e] text-[#ffffff]'
