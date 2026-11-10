@@ -13,9 +13,9 @@
 //! Offsets count UTF-16 code units of output text, which is what a browser's
 //! `string.length` measures, so client and server agree on positions.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -25,11 +25,8 @@ use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{broadcast, mpsc, Mutex, Notify};
+use tokio::sync::{broadcast, mpsc, Mutex, Notify, RwLock};
 use tracing::warn;
-
-use crate::sandbox;
-use crate::state::AppState;
 
 const CONTROL_PREFIX: &str = "__handover_control__:";
 
@@ -177,32 +174,117 @@ impl PtySession {
     }
 }
 
-/// Reads what is needed to start this instance's shell.
-async fn spawn_command(state: &AppState, instance_id: &str) -> Result<CommandBuilder, String> {
-    let instance = state
-        .instance(instance_id)
-        .await
-        .ok_or("Instance not found. Close this terminal and open a new one.")?;
-    let cwd = state
-        .project(&instance.project_id)
-        .await
-        .map(|p| PathBuf::from(p.path))
-        .filter(|p| p.is_dir())
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(PathBuf::from)
-                .filter(|p| p.is_dir())
-        });
-    sandbox::shell_command(&instance, cwd.as_deref()).map_err(|_| {
-        "Docker container is not running for this terminal. Try closing and reopening it."
-            .to_string()
-    })
+// ── Terminals ──────────────────────────────────────────────────────────────
+
+type Sessions = Arc<RwLock<HashMap<String, Arc<PtySession>>>>;
+
+/// Every running shell, by Instance id. Shells outlive client connections;
+/// one ends when it exits, or when [`Terminals::shutdown`] is called for
+/// its Instance.
+#[derive(Default)]
+pub struct Terminals {
+    sessions: Sessions,
+    /// Serializes starting and shutting down a shell per Instance.
+    setup_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl Terminals {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    async fn setup_lock(&self, instance_id: &str) -> Arc<Mutex<()>> {
+        self.setup_locks
+            .lock()
+            .await
+            .entry(instance_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// The Instance's running shell, starting one from `command` if there is
+    /// none. `command` is only called when a shell must be started.
+    pub async fn attach_or_spawn<F, Fut>(
+        &self,
+        instance_id: &str,
+        command: F,
+    ) -> Result<Arc<PtySession>, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<CommandBuilder, String>>,
+    {
+        let lock = self.setup_lock(instance_id).await;
+        let _guard = lock.lock().await;
+        if let Some(existing) = self.sessions.read().await.get(instance_id) {
+            if !existing.is_exited() {
+                return Ok(existing.clone());
+            }
+        }
+        let cmd = command().await?;
+        let session = spawn_session(&self.sessions, instance_id, cmd).await?;
+        self.sessions
+            .write()
+            .await
+            .insert(instance_id.to_string(), session.clone());
+        Ok(session)
+    }
+
+    /// Ends the Instance's shell (attached clients receive `exit`). Waits for
+    /// a shell that is still starting, so it can't slip in afterwards.
+    pub async fn shutdown(&self, instance_id: &str) {
+        let lock = self.setup_lock(instance_id).await;
+        {
+            let _guard = lock.lock().await;
+            if let Some(session) = self.sessions.write().await.remove(instance_id) {
+                session.kill();
+            }
+        }
+        self.setup_locks.lock().await.remove(instance_id);
+    }
+
+    /// How many shells are running.
+    pub async fn running(&self) -> usize {
+        self.sessions.read().await.len()
+    }
+
+    /// For each given Instance with a running shell: its shell's pid.
+    pub async fn running_shells(&self, instance_ids: &[&str]) -> HashMap<String, Option<u32>> {
+        let sessions = self.sessions.read().await;
+        instance_ids
+            .iter()
+            .filter_map(|id| sessions.get(*id).map(|s| (id.to_string(), s.shell_pid)))
+            .collect()
+    }
+
+    /// Types `prompt` into the Instance's running shell and submits it with
+    /// `\r` (what the Enter key sends). Raw-mode TUIs such as Claude Code
+    /// treat `\n` as "insert newline", not "submit". The submit key is sent
+    /// separately after a short pause so TUIs don't fold it into the pasted
+    /// text. False if the Instance has no running shell.
+    pub async fn type_prompt(&self, instance_id: &str, prompt: &str) -> bool {
+        let Some(input_tx) = self
+            .sessions
+            .read()
+            .await
+            .get(instance_id)
+            .map(|s| s.input_tx.clone())
+        else {
+            return false;
+        };
+        if input_tx
+            .send(prompt_as_single_line(prompt).into_bytes())
+            .is_err()
+        {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        input_tx.send(b"\r".to_vec()).is_ok()
+    }
 }
 
 /// Starts a shell and the tasks that pump its input and output.
 async fn spawn_session(
-    state: &Arc<AppState>,
+    sessions: &Sessions,
     instance_id: &str,
     cmd: CommandBuilder,
 ) -> Result<Arc<PtySession>, String> {
@@ -269,7 +351,7 @@ async fn spawn_session(
         client: std::sync::Mutex::new(None),
     });
 
-    let pump_state = state.clone();
+    let pump_sessions = sessions.clone();
     let pump_instance = instance_id.to_string();
     tokio::spawn(async move {
         let mut pending = Vec::new();
@@ -286,7 +368,7 @@ async fn spawn_session(
             log.mark_exited();
         }
         let _ = kill_tx.try_send(());
-        let mut sessions = pump_state.pty_sessions.write().await;
+        let mut sessions = pump_sessions.write().await;
         if sessions.get(&pump_instance).map(|s| s.session_id) == Some(session_id) {
             sessions.remove(&pump_instance);
         }
@@ -295,73 +377,10 @@ async fn spawn_session(
     Ok(session)
 }
 
-/// The instance's running shell, starting one if there is none.
-async fn get_or_spawn_session(
-    state: &Arc<AppState>,
-    instance_id: &str,
-) -> Result<Arc<PtySession>, String> {
-    let setup_lock = state
-        .ws_session_locks
-        .lock()
-        .await
-        .entry(instance_id.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone();
-    let _guard = setup_lock.lock().await;
-
-    if let Some(existing) = state.pty_sessions.read().await.get(instance_id) {
-        if !existing.is_exited() {
-            return Ok(existing.clone());
-        }
-    }
-    let cmd = spawn_command(state, instance_id).await?;
-    let session = spawn_session(state, instance_id, cmd).await?;
-    state
-        .pty_sessions
-        .write()
-        .await
-        .insert(instance_id.to_string(), session.clone());
-    Ok(session)
-}
-
 /// Collapses a prompt to one line so it is submitted once: interior newlines
 /// would otherwise be read as several separate submissions.
 fn prompt_as_single_line(prompt: &str) -> String {
     prompt.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Types `prompt` into the instance's running shell and submits it with `\r`
-/// (what the Enter key sends). Raw-mode TUIs such as Claude Code treat `\n`
-/// as "insert newline", not "submit". The submit key is sent separately after
-/// a short pause so TUIs don't fold it into the pasted text. False if the
-/// instance has no running shell.
-pub async fn type_prompt(state: &AppState, instance_id: &str, prompt: &str) -> bool {
-    let Some(input_tx) = state
-        .pty_sessions
-        .read()
-        .await
-        .get(instance_id)
-        .map(|s| s.input_tx.clone())
-    else {
-        return false;
-    };
-    if input_tx
-        .send(prompt_as_single_line(prompt).into_bytes())
-        .is_err()
-    {
-        return false;
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    input_tx.send(b"\r".to_vec()).is_ok()
-}
-
-/// Called when an instance is deleted or its project unloaded: kills the
-/// shell (attached clients receive `exit`) and forgets the setup lock.
-pub async fn shutdown_instance_pty(state: &AppState, instance_id: &str) {
-    if let Some(session) = state.pty_sessions.write().await.remove(instance_id) {
-        session.kill();
-    }
-    state.ws_session_locks.lock().await.remove(instance_id);
 }
 
 // ── Attaching a client ─────────────────────────────────────────────────────
@@ -401,15 +420,19 @@ async fn send_output(ws_tx: &mut WsTx, text: &str) -> bool {
 /// Attaches one WebSocket client to the instance's shell until the client
 /// leaves, another client takes over, or the shell exits. Never kills the
 /// shell.
-pub async fn handle_pty_socket(
+pub async fn handle_pty_socket<F, Fut>(
     socket: WebSocket,
     instance_id: String,
     params: AttachParams,
-    state: Arc<AppState>,
-) {
+    terminals: Arc<Terminals>,
+    command: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<CommandBuilder, String>>,
+{
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    let session = match get_or_spawn_session(&state, &instance_id).await {
+    let session = match terminals.attach_or_spawn(&instance_id, command).await {
         Ok(s) => s,
         Err(message) => {
             warn!("pty attach failed for {instance_id}: {message}");
@@ -589,6 +612,46 @@ fn spawn_pty_child(cmd: CommandBuilder) -> anyhow::Result<PtyHandles> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sleeper() -> CommandBuilder {
+        let mut c = CommandBuilder::new("sleep");
+        c.arg("30");
+        c
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_a_spawn_leaves_no_shell_behind() {
+        let terminals = Terminals::new();
+        let t = terminals.clone();
+        let attach = tokio::spawn(async move {
+            t.attach_or_spawn("i", || async {
+                // Still starting when shutdown arrives.
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                Ok(sleeper())
+            })
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        terminals.shutdown("i").await;
+        assert!(attach.await.unwrap().is_ok());
+        assert_eq!(terminals.running().await, 0);
+    }
+
+    #[tokio::test]
+    async fn attach_reuses_the_running_shell() {
+        let terminals = Terminals::new();
+        let a = terminals
+            .attach_or_spawn("i", || async { Ok(sleeper()) })
+            .await
+            .unwrap();
+        let b = terminals
+            .attach_or_spawn("i", || async { Err("must not respawn".to_string()) })
+            .await
+            .unwrap();
+        assert_eq!(a.session_id, b.session_id);
+        terminals.shutdown("i").await;
+        assert_eq!(terminals.running().await, 0);
+    }
 
     #[test]
     fn prompt_as_single_line_collapses_newlines() {
