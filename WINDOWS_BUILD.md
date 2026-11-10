@@ -2,7 +2,7 @@
 
 This document explains how to build, run, and distribute **Handover** on Windows.
 
-Handover is a **Tauri 2 + React** desktop app with a **Rust backend sidecar** (`handover-backend`). The Linux AppImage (**v1.0.6**) is tested and released. Windows packaging is supported by Tauri, but **Windows-specific terminal behavior still needs validation and likely small backend changes**.
+Handover is a **Tauri 2 + React** desktop app with a **Rust backend sidecar** (`handover-backend`). The Linux AppImage (**v1.0.8**) is tested and released. Windows packaging is supported by Tauri, but **Windows-specific terminal behavior still needs validation and likely small backend changes**.
 
 ---
 
@@ -35,9 +35,9 @@ Handover is a **Tauri 2 + React** desktop app with a **Rust backend sidecar** (`
 | `handover_app/src-tauri/binaries/` | Bundled `handover-backend-x86_64-pc-windows-msvc.exe` |
 | `handover/docker/` | Docker sandbox image (`handover-base:latest`) |
 
-**Current release target:** v1.0.6
+**Current release target:** v1.0.8
 
-**Linux today:** `Handover_1.0.6_amd64.AppImage`
+**Linux today:** `Handover_1.0.8_amd64.AppImage`
 
 **Windows goal:** `.msi` and/or `.exe` under Tauri’s `bundle/` output directory.
 
@@ -236,8 +236,8 @@ handover_app\src-tauri\target\release\
   handover-desktop.exe
 
 handover_app\src-tauri\target\release\bundle\
-  msi\Handover_1.0.6_x64_en-US.msi          (name may vary)
-  nsis\Handover_1.0.6_x64-setup.exe         (if NSIS enabled)
+  msi\Handover_1.0.8_x64_en-US.msi          (name may vary)
+  nsis\Handover_1.0.8_x64-setup.exe         (if NSIS enabled)
 ```
 
 Sidecar copied before bundling:
@@ -299,16 +299,21 @@ Tauri bundles the sidecar next to the app and starts it at runtime.
 
 ### What still needs Windows validation
 
-The Rust PTY layer (`handover_rust/src/pty.rs`) was written and tested primarily on Linux:
+The shell command each terminal runs lives in one place,
+`sandbox::shell_command` in `handover_rust/src/sandbox.rs`, and was written
+and tested primarily on Linux:
 
 ```rust
 // Native mode today (Linux-oriented)
 let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
 c.args(["-l", "-i"]);
 
-// Docker mode
-docker exec -it <container> /bin/bash
+// Docker mode (sources the instance's secret env file, then runs bash)
+docker exec -it <container> /bin/bash -c ". /run/handover/env; exec /bin/bash"
 ```
+
+A Windows native shell (PowerShell / cmd / WSL / Git Bash) is a change to that
+one function's `Native` branch.
 
 On Windows:
 
@@ -588,7 +593,7 @@ To make Windows a first-class platform:
 
 ## Version policy
 
-Do not bump version numbers unless explicitly requested. Current release line: **v1.0.6**.
+Do not bump version numbers unless explicitly requested. Current release line: **v1.0.8**.
 
 See [`VERSION_POLICY.md`](VERSION_POLICY.md).
 
