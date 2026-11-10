@@ -1,11 +1,14 @@
 import axios from 'axios'
-import { getBackendBaseUrl } from './platform.js'
+import { getBackendBaseUrl, getBackendToken } from './platform.js'
 
 export const BASE_URL = getBackendBaseUrl()
 
 const client = axios.create({
   baseURL: BASE_URL,
-  headers: { 'Content-Type': 'application/json' },
+  headers: {
+    'Content-Type': 'application/json',
+    'X-Handover-Token': getBackendToken(),
+  },
 })
 
 async function request(fn) {
@@ -164,22 +167,13 @@ export async function getHandoffFile(projectId, filename) {
 }
 
 export async function exportHandoffLog(projectId) {
-  try {
+  return request(async () => {
     const res = await client.get(
       `/api/projects/${encodeURIComponent(projectId)}/handoffs/export`,
       { responseType: 'text' },
     )
-    return { data: res.data, error: null }
-  } catch (error) {
-    const err = axios.isAxiosError(error)
-      ? error.response?.data !== undefined
-        ? typeof error.response.data === 'object' && error.response.data !== null
-          ? { httpStatus: error.response.status, ...error.response.data }
-          : { httpStatus: error.response.status, detail: error.response.data }
-        : { message: error.message, httpStatus: error.response?.status }
-      : error
-    return { data: null, error: err }
-  }
+    return res.data
+  })
 }
 
 export async function getProjectResources(projectId) {

@@ -1,3 +1,4 @@
+mod auth;
 mod docker;
 mod governor;
 mod handoff;
@@ -19,7 +20,6 @@ use clap::Parser;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -1135,10 +1135,18 @@ async fn main() -> anyhow::Result<()> {
         docker: docker_slot,
     };
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    // Per-launch secret from the desktop shell (env, not argv, so other
+    // local users can't read it from the process list).
+    let token = match std::env::var("HANDOVER_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => auth::AuthToken(t.trim().into()),
+        _ => {
+            let t = auth::AuthToken::generate();
+            // Standalone/dev runs: print it so a browser dev session can use
+            // http://127.0.0.1:5173/?port=<port>&token=<token>
+            println!("handover-backend token: {}", t.0);
+            t
+        }
+    };
 
     let app = Router::new()
         .route("/", get(root))
@@ -1187,7 +1195,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/ws/pty/{instance_id}", get(ws_pty))
         .with_state(ctx)
-        .layer(cors);
+        .layer(axum::middleware::from_fn_with_state(
+            token,
+            auth::require_token,
+        ))
+        .layer(auth::cors_layer());
 
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
     tracing::debug!("handover-backend listening on http://{addr}");

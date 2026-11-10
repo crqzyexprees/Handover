@@ -12,6 +12,7 @@
     "shell:default",
     "clipboard-manager:allow-read-text",
     "clipboard-manager:allow-write-text",
-    "allow-get-backend-port"
+    "allow-get-backend-port",
+    "allow-get-backend-token"
   ]
 }

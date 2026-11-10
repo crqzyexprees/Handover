@@ -24,11 +24,25 @@ export function getBackendPort() {
   return fromQuery ?? '8765'
 }
 
+/**
+ * Per-launch secret the backend requires. Injected by Tauri; for browser-only
+ * dev, pass the token the standalone backend prints: `?port=…&token=…`.
+ */
+export function getBackendToken() {
+  if (window.__HANDOVER_BACKEND_TOKEN__ != null) {
+    return String(window.__HANDOVER_BACKEND_TOKEN__)
+  }
+  return new URLSearchParams(window.location.search).get('token') ?? ''
+}
+
 export function getBackendBaseUrl() {
   return `http://127.0.0.1:${getBackendPort()}`
 }
 
+/** WebSocket URL with the token as a query parameter (browsers can't set WS headers). */
 export function getBackendWsUrl(path) {
   const normalized = path.startsWith('/') ? path : `/${path}`
-  return `ws://127.0.0.1:${getBackendPort()}${normalized}`
+  const sep = normalized.includes('?') ? '&' : '?'
+  const token = encodeURIComponent(getBackendToken())
+  return `ws://127.0.0.1:${getBackendPort()}${normalized}${sep}token=${token}`
 }

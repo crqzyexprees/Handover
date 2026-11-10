@@ -144,7 +144,9 @@ For UI work without the desktop shell:
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. API calls default to port `8765` unless you pass `?port=` in the URL. No native folder picker in the browser.
+Start the standalone backend (below), then open
+`http://127.0.0.1:5173/?port=8765&token=<token>` using the token the backend
+prints at startup. No native folder picker in the browser.
 
 ## Standalone backend
 
@@ -154,6 +156,13 @@ To run the Rust API without Tauri:
 cd handover_rust
 cargo run -- --host 127.0.0.1 --port 8765
 ```
+
+Every API and WebSocket call needs the backend's token (`X-Handover-Token`
+header, or `?token=` on WebSockets); only `GET /` is open. The desktop app
+generates a fresh token per launch and passes it via `HANDOVER_TOKEN`. Run
+standalone without it and the backend generates one and prints it. This stops
+other web pages in your browser from reaching your terminals through
+localhost; CORS is also limited to the app's own origins.
 
 ## Debug logging
 

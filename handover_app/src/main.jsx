@@ -5,6 +5,7 @@ async function bootstrap() {
   if (import.meta.env.TAURI_ENV_PLATFORM) {
     const { invoke } = await import('@tauri-apps/api/core')
     window.__HANDOVER_BACKEND_PORT__ = String(await invoke('get_backend_port'))
+    window.__HANDOVER_BACKEND_TOKEN__ = String(await invoke('get_backend_token'))
   }
 
   const { default: App } = await import('./App.jsx')

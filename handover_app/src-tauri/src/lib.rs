@@ -10,12 +10,28 @@ use tauri_plugin_shell::ShellExt;
 
 struct BackendState {
     port: u16,
+    /// Per-launch secret the backend requires on every API/WebSocket call.
+    token: String,
     child: Mutex<Option<CommandChild>>,
 }
 
 #[tauri::command]
 fn get_backend_port(state: State<'_, BackendState>) -> u16 {
     state.port
+}
+
+#[tauri::command]
+fn get_backend_token(state: State<'_, BackendState>) -> String {
+    state.token.clone()
+}
+
+/// 244 random bits from two v4 UUIDs.
+fn generate_token() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 fn pick_free_port() -> Result<u16> {
@@ -56,7 +72,7 @@ fn wait_for_backend(port: u16) -> Result<()> {
     anyhow::bail!("handover-backend did not respond on http://127.0.0.1:{port}/")
 }
 
-fn spawn_backend(app: &tauri::AppHandle, port: u16) -> Result<CommandChild> {
+fn spawn_backend(app: &tauri::AppHandle, port: u16, token: &str) -> Result<CommandChild> {
     let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into());
     let sidecar = app
         .shell()
@@ -65,6 +81,7 @@ fn spawn_backend(app: &tauri::AppHandle, port: u16) -> Result<CommandChild> {
     let (_rx, child) = sidecar
         .args(["--host", "127.0.0.1", "--port", &port.to_string()])
         .env("RUST_LOG", rust_log)
+        .env("HANDOVER_TOKEN", token)
         .spawn()
         .context("failed to spawn handover-backend sidecar")?;
     wait_for_backend(port)?;
@@ -92,14 +109,16 @@ pub fn run() {
                 }
             }
             let port = pick_free_port()?;
-            let child = spawn_backend(app.handle(), port)?;
+            let token = generate_token();
+            let child = spawn_backend(app.handle(), port, &token)?;
             app.manage(BackendState {
                 port,
+                token,
                 child: Mutex::new(Some(child)),
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_backend_port])
+        .invoke_handler(tauri::generate_handler![get_backend_port, get_backend_token])
         .build(tauri::generate_context!());
 
     match result {
