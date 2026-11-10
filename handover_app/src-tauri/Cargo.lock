@@ -1264,6 +1264,7 @@ version = "1.0.8"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-clipboard-manager",

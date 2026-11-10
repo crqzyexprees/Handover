@@ -30,10 +30,18 @@ The window reconnects automatically (up to 5 tries); ↻ forces a reattach,
 or starts a new shell if the old one exited. A shell ends only when you
 `exit` it, delete the terminal, or unload the project.
 
+Shells also survive quitting the app. On quit, the app stops the backend only
+if no shell is running; otherwise the backend keeps running and the next
+launch reconnects to it (its port and token are in `backend.json` in the
+app's local data folder, e.g. `~/.local/share/com.crqzyexprees.handover/` on Linux), and
+your terminals reappear with their scrollback. A backend left running exits by
+itself after 10 minutes with no shells and no app open. Its log is
+`backend.log` in the same folder.
+
 If typing fails after code changes, do a **full restart** (not hot reload):
 
 ```bash
-pkill -f handover-backend; pkill -f tauri
+pkill -f handover-backend; pkill -f tauri   # also ends any shells kept running
 cd handover_app && bash scripts/prepare-backend-sidecar.sh debug && npm run dev:tauri
 ```
 

@@ -344,6 +344,7 @@ mod tests {
             container_id: container.map(String::from),
             mem_limit: None,
             custom_env_vars: BTreeMap::from([("K".into(), "v".into())]),
+            opened_at: 0.0,
         }
     }
 

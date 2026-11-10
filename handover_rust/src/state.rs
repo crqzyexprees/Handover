@@ -30,6 +30,8 @@ pub struct AppState {
     pub app_config: RwLock<Value>,
     /// Where `state.json` lives.
     persist_path: PathBuf,
+    /// Unix seconds of the last authenticated request.
+    last_activity: std::sync::atomic::AtomicU64,
 }
 
 /// On disk, entries stay untyped so one malformed project can be skipped
@@ -54,6 +56,7 @@ impl AppState {
     pub fn with_persist_path(persist_path: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             persist_path,
+            last_activity: std::sync::atomic::AtomicU64::new(monotonic_secs() as u64),
             projects: RwLock::new(HashMap::new()),
             project_configs: RwLock::new(HashMap::new()),
             instances: RwLock::new(HashMap::new()),
@@ -149,14 +152,37 @@ impl AppState {
         self.instances.read().await.get(instance_id).cloned()
     }
 
+    /// A project's instances, oldest first (the order its tabs show).
     pub async fn instances_of(&self, project_id: &str) -> Vec<Instance> {
-        self.instances
+        let mut list: Vec<Instance> = self
+            .instances
             .read()
             .await
             .values()
             .filter(|i| i.project_id == project_id)
             .cloned()
-            .collect()
+            .collect();
+        list.sort_by(|a, b| {
+            a.opened_at
+                .total_cmp(&b.opened_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        list
+    }
+
+    /// Records an authenticated request (see `--idle-exit-secs`).
+    pub fn touch(&self) {
+        self.last_activity.store(
+            monotonic_secs() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    pub fn idle_secs(&self) -> u64 {
+        (monotonic_secs() as u64).saturating_sub(
+            self.last_activity
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Saved config for a project, or the defaults for its folder.

@@ -56,6 +56,11 @@ struct Cli {
     host: String,
     #[arg(long, default_value_t = 8765)]
     port: u16,
+    /// Exit after this many seconds with no running shells and no requests.
+    /// The desktop app sets it so a backend it leaves running (to keep
+    /// shells alive across app restarts) doesn't outlive its usefulness.
+    #[arg(long)]
+    idle_exit_secs: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -63,6 +68,8 @@ struct ServerCtx {
     state: Arc<AppState>,
     docker: Arc<RwLock<Option<Arc<DockerRuntime>>>>,
     sandboxes: Sandboxes,
+    /// Notified to stop the server (see `/api/shutdown`).
+    shutdown: Arc<tokio::sync::Notify>,
 }
 
 fn api_err(status: StatusCode, detail: impl Into<String>) -> Response {
@@ -179,7 +186,57 @@ struct HandoffRequest {
 }
 
 async fn root() -> Json<Value> {
-    Json(json!({ "status": "ok", "service": "handover-backend" }))
+    Json(json!({
+        "status": "ok",
+        "service": "handover-backend",
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// Authenticated liveness check; the desktop app polls it as a heartbeat.
+async fn ping(State(ctx): State<ServerCtx>) -> Json<Value> {
+    Json(json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "shells": ctx.state.pty_sessions.read().await.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ShutdownBody {
+    #[serde(default = "default_true")]
+    only_if_idle: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Stops the backend; with `only_if_idle`, only when no shell is running.
+/// The desktop app calls this on quit, so running shells survive the quit.
+async fn shutdown(State(ctx): State<ServerCtx>, Json(body): Json<ShutdownBody>) -> Json<Value> {
+    let shells = ctx.state.pty_sessions.read().await.len();
+    if body.only_if_idle && shells > 0 {
+        return Json(json!({ "stopping": false, "shells": shells }));
+    }
+    let signal = ctx.shutdown.clone();
+    tokio::spawn(async move {
+        // Let this response reach the caller first.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        signal.notify_one();
+    });
+    Json(json!({ "stopping": true, "shells": shells }))
+}
+
+async fn track_activity(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if req.uri().path() != "/" {
+        state.touch();
+    }
+    next.run(req).await
 }
 
 async fn docker_health(State(ctx): State<ServerCtx>) -> Json<Value> {
@@ -210,21 +267,18 @@ async fn update_config(State(ctx): State<ServerCtx>, Json(body): Json<Value>) ->
     Json(json!({ "status": "ok" }))
 }
 
+/// Projects with their config and open instances, so a reopened window can
+/// re-attach to terminals whose shells kept running.
 async fn list_projects(State(ctx): State<ServerCtx>) -> Json<Vec<Value>> {
-    let projects = ctx.state.projects.read().await;
-    let configs = ctx.state.project_configs.read().await;
-    Json(
-        projects
-            .values()
-            .map(|p| {
-                let config = configs
-                    .get(&p.id)
-                    .cloned()
-                    .unwrap_or_else(|| ProjectConfig::defaults_for(&p.path));
-                project_view(p, &config)
-            })
-            .collect(),
-    )
+    let projects: Vec<Project> = ctx.state.projects.read().await.values().cloned().collect();
+    let mut out = Vec::with_capacity(projects.len());
+    for p in projects {
+        let config = ctx.state.stored_config(&p).await;
+        let mut view = project_view(&p, &config);
+        view["instances"] = json!(ctx.state.instances_of(&p.id).await);
+        out.push(view);
+    }
+    Json(out)
 }
 
 async fn create_project(
@@ -443,6 +497,7 @@ async fn start_instance(
         mem_limit: container_id.as_ref().map(|_| mem_limit),
         container_id,
         custom_env_vars,
+        opened_at: monotonic_secs(),
     };
     ctx.state
         .instances
@@ -772,6 +827,8 @@ async fn ws_pty(
 fn app(ctx: ServerCtx, token: auth::AuthToken) -> Router {
     Router::new()
         .route("/", get(root))
+        .route("/api/ping", get(ping))
+        .route("/api/shutdown", post(shutdown))
         .route("/api/health/docker", get(docker_health))
         .route("/api/config", get(get_config).put(update_config))
         .route("/api/projects", get(list_projects).post(create_project))
@@ -816,7 +873,11 @@ fn app(ctx: ServerCtx, token: auth::AuthToken) -> Router {
             post(broadcast_prompt),
         )
         .route("/ws/pty/{instance_id}", get(ws_pty))
-        .with_state(ctx)
+        .with_state(ctx.clone())
+        .layer(axum::middleware::from_fn_with_state(
+            ctx.state,
+            track_activity,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             token,
             auth::require_token,
@@ -858,7 +919,11 @@ async fn main() -> anyhow::Result<()> {
         state,
         docker: docker_slot,
         sandboxes,
+        shutdown: Arc::new(tokio::sync::Notify::new()),
     };
+    if let Some(idle) = cli.idle_exit_secs {
+        spawn_idle_watchdog(&ctx, idle);
+    }
 
     // Per-launch secret from the desktop shell (env, not argv, so other
     // local users can't read it from the process list).
@@ -873,13 +938,72 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let app = app(ctx, token);
+    let app = app(ctx.clone(), token);
 
     let addr: SocketAddr = format!("{}:{}", cli.host, cli.port).parse()?;
     tracing::debug!("handover-backend listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    tokio::select! {
+        served = std::future::IntoFuture::into_future(axum::serve(listener, app)) => served?,
+        () = stop_requested(&ctx.shutdown) => {}
+    }
+    teardown_all(&ctx).await;
     Ok(())
+}
+
+async fn stop_requested(shutdown: &tokio::sync::Notify) {
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        () = shutdown.notified() => {}
+        _ = tokio::signal::ctrl_c() => {}
+        () = term => {}
+    }
+}
+
+/// Ends every shell and removes every container before exiting, so nothing
+/// is left running behind a backend that is gone.
+async fn teardown_all(ctx: &ServerCtx) {
+    let instances: Vec<Instance> = ctx.state.instances.read().await.values().cloned().collect();
+    for instance in instances {
+        pty::shutdown_instance_pty(&ctx.state, &instance.id).await;
+        if let Err(e) = ctx
+            .sandboxes
+            .for_instance(&instance)
+            .teardown(&instance)
+            .await
+        {
+            warn!("failed to tear down instance on exit: {e}");
+        }
+    }
+    if let Err(e) = ctx.state.save_persisted().await {
+        warn!("failed to persist state on exit: {e}");
+    }
+}
+
+fn spawn_idle_watchdog(ctx: &ServerCtx, idle_secs: u64) {
+    let state = ctx.state.clone();
+    let shutdown = ctx.shutdown.clone();
+    tokio::spawn(async move {
+        let check_every = std::time::Duration::from_secs(idle_secs.clamp(1, 30));
+        loop {
+            tokio::time::sleep(check_every).await;
+            if state.pty_sessions.read().await.is_empty() && state.idle_secs() >= idle_secs {
+                tracing::info!("no shells and no requests for {idle_secs}s; exiting");
+                shutdown.notify_one();
+                return;
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -909,6 +1033,7 @@ mod tests {
             state: AppState::with_persist_path(dir.path().join("state.json")),
             docker: Arc::new(RwLock::new(None)),
             sandboxes: Sandboxes::new(Arc::new(NativeSandbox), docker.clone()),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
         };
         Harness {
             _dir: dir,
@@ -1059,6 +1184,42 @@ mod tests {
         let (_, list) = h.call("GET", "/api/projects", Value::Null).await;
         assert_eq!(list[0]["name"], "Renamed");
         assert_eq!(list[0]["config"]["project_name"], "Renamed");
+    }
+
+    #[tokio::test]
+    async fn project_list_carries_open_instances_oldest_first() {
+        let h = harness(FakeSandbox::default());
+        let pid = h.create_project().await;
+        let mut opened = Vec::new();
+        for _ in 0..3 {
+            let (_, inst) = h
+                .call(
+                    "POST",
+                    "/api/instances/start",
+                    json!({ "project_id": pid, "sandbox_mode": "native" }),
+                )
+                .await;
+            opened.push(inst["id"].as_str().unwrap().to_string());
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let (_, list) = h.call("GET", "/api/projects", Value::Null).await;
+        let listed: Vec<&str> = list[0]["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed, opened);
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_signals_the_server_to_stop() {
+        let h = harness(FakeSandbox::default());
+        let (_, body) = h.call("POST", "/api/shutdown", json!({})).await;
+        assert_eq!(body["stopping"], true);
+        tokio::time::timeout(std::time::Duration::from_secs(2), h.ctx.shutdown.notified())
+            .await
+            .expect("shutdown was not signalled");
     }
 
     #[tokio::test]

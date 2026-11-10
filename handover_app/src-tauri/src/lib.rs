@@ -1,18 +1,41 @@
-use std::io::{BufRead, BufReader, Write};
+//! Desktop shell: finds or starts the `handover-backend` and hands its port
+//! and token to the UI.
+//!
+//! The backend outlives the window so running shells survive an app quit:
+//! on quit we ask it to stop only if no shell is running. Its port and token
+//! are kept in a private runtime file (`backend.json` in the app's local data
+//! dir); the next launch reuses that backend, and its terminals re-attach.
+//! While the app is open it sends a heartbeat; a backend left behind exits
+//! by itself after `IDLE_EXIT_SECS` with no shells and no requests.
+
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use tauri::{Manager, RunEvent, State};
-use tauri_plugin_shell::process::CommandChild;
-use tauri_plugin_shell::ShellExt;
+
+const IDLE_EXIT_SECS: u64 = 600;
+const HEARTBEAT: Duration = Duration::from_secs(60);
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 struct BackendState {
     port: u16,
-    /// Per-launch secret the backend requires on every API/WebSocket call.
+    /// Secret the backend requires on every API/WebSocket call.
     token: String,
-    child: Mutex<Option<CommandChild>>,
+    info_path: PathBuf,
+}
+
+/// Contents of the runtime file.
+#[derive(Serialize, Deserialize)]
+struct BackendInfo {
+    port: u16,
+    token: String,
+    pid: u32,
+    version: String,
 }
 
 #[tauri::command]
@@ -39,60 +62,227 @@ fn pick_free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// One plain-HTTP `GET /` against the local backend; true on a 2xx status.
-fn backend_responds(port: u16) -> bool {
+/// One plain HTTP/1.0 request to the local backend: `(status, body)`.
+fn http(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&str>,
+) -> Option<(u16, String)> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else {
-        return false;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let request = format!("GET / HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(1)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    let mut req = format!("{method} {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n");
+    if let Some(t) = token {
+        req.push_str(&format!("X-Handover-Token: {t}\r\n"));
     }
-    let mut status_line = String::new();
-    if BufReader::new(stream).read_line(&mut status_line).is_err() {
-        return false;
+    if let Some(b) = body {
+        req.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            b.len()
+        ));
     }
-    // "HTTP/1.1 200 OK"
-    status_line
-        .split_whitespace()
-        .nth(1)
-        .is_some_and(|code| code.starts_with('2'))
+    req.push_str("\r\n");
+    req.push_str(body.unwrap_or(""));
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    // "HTTP/1.1 200 OK\r\n...\r\n\r\nbody"
+    let status = raw.split_whitespace().nth(1)?.parse().ok()?;
+    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string())?;
+    Some((status, body))
 }
 
-fn wait_for_backend(port: u16) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(120);
+#[derive(Deserialize)]
+struct Ping {
+    version: String,
+    shells: usize,
+}
+
+/// The backend's status, if it is up and accepts this token.
+fn ping(port: u16, token: &str) -> Option<Ping> {
+    match http(port, "GET", "/api/ping", Some(token), None)? {
+        (200, body) => serde_json::from_str(&body).ok(),
+        _ => None,
+    }
+}
+
+/// Asks the backend to exit if no shell is running. True if it is stopping.
+fn stop_if_idle(port: u16, token: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Reply {
+        stopping: bool,
+    }
+    match http(
+        port,
+        "POST",
+        "/api/shutdown",
+        Some(token),
+        Some(r#"{"only_if_idle":true}"#),
+    ) {
+        Some((200, body)) => serde_json::from_str::<Reply>(&body).is_ok_and(|r| r.stopping),
+        _ => false,
+    }
+}
+
+fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if backend_responds(port) {
-            return Ok(());
+        if ready() {
+            return true;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    anyhow::bail!("handover-backend did not respond on http://127.0.0.1:{port}/")
+    false
 }
 
-fn spawn_backend(app: &tauri::AppHandle, port: u16, token: &str) -> Result<CommandChild> {
-    let rust_log = std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into());
-    let sidecar = app
-        .shell()
-        .sidecar("handover-backend")
-        .context("handover-backend sidecar not found; run scripts/prepare-backend-sidecar.sh")?;
-    let (_rx, child) = sidecar
-        .args(["--host", "127.0.0.1", "--port", &port.to_string()])
-        .env("RUST_LOG", rust_log)
-        .env("HANDOVER_TOKEN", token)
-        .spawn()
-        .context("failed to spawn handover-backend sidecar")?;
-    wait_for_backend(port)?;
-    Ok(child)
+fn read_info(path: &Path) -> Option<BackendInfo> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
-fn stop_backend(state: &BackendState) {
-    if let Ok(mut guard) = state.child.lock() {
-        if let Some(child) = guard.take() {
-            let _ = child.kill();
+/// Writes a file only the current user can read (it holds the token).
+fn write_private(path: &Path, contents: &str) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)?.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+/// The bundled backend binary (Tauri places sidecars next to the app binary).
+fn bundled_backend() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("cannot locate the app binary")?;
+    let name = if cfg!(windows) {
+        "handover-backend.exe"
+    } else {
+        "handover-backend"
+    };
+    let path = exe.parent().context("app binary has no folder")?.join(name);
+    anyhow::ensure!(
+        path.is_file(),
+        "handover-backend not found at {}; run scripts/prepare-backend-sidecar.sh",
+        path.display()
+    );
+    Ok(path)
+}
+
+/// Copies the backend out of the app bundle before running it: an AppImage
+/// is a mount that disappears when the app quits, and the backend may keep
+/// running after that. Falls back to the bundled path if copying fails.
+fn runnable_copy(bundled: &Path, data_dir: &Path) -> PathBuf {
+    let dest = data_dir
+        .join("bin")
+        .join(bundled.file_name().unwrap_or_default());
+    let tmp = dest.with_extension("tmp");
+    let copied = std::fs::create_dir_all(data_dir.join("bin"))
+        .and_then(|_| std::fs::copy(bundled, &tmp))
+        // Rename, not overwrite: an old backend may still be running the file.
+        .and_then(|_| std::fs::rename(&tmp, &dest));
+    match copied {
+        Ok(()) => dest,
+        Err(e) => {
+            eprintln!("could not copy backend to {}: {e}", dest.display());
+            bundled.to_path_buf()
         }
+    }
+}
+
+/// Starts a backend that isn't tied to this process, so it can outlive it.
+fn spawn_backend(data_dir: &Path, port: u16, token: &str) -> Result<u32> {
+    let exe = runnable_copy(&bundled_backend()?, data_dir);
+    let log = std::fs::File::create(data_dir.join("backend.log"))
+        .context("failed to create backend.log")?;
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+        "--idle-exit-secs",
+        &IDLE_EXIT_SECS.to_string(),
+    ])
+    .env(
+        "RUST_LOG",
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "warn".into()),
+    )
+    // Env, not argv, so other local users can't read it from the process list.
+    .env("HANDOVER_TOKEN", token)
+    .stdin(Stdio::null())
+    .stdout(log.try_clone()?)
+    .stderr(log);
+    // Own process group: a Ctrl-C or hangup aimed at the app doesn't reach it.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    #[cfg(windows)]
+    {
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::os::windows::process::CommandExt::creation_flags(
+            &mut cmd,
+            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+        );
+    }
+    let mut child = cmd.spawn().context("failed to start handover-backend")?;
+    let pid = child.id();
+    // Reap it if it exits while the app is open; never kill it.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    anyhow::ensure!(
+        wait_until(Duration::from_secs(120), || ping(port, token).is_some()),
+        "handover-backend did not respond on http://127.0.0.1:{port}/"
+    );
+    Ok(pid)
+}
+
+/// Reuses the backend from a previous launch when it is still up (keeping
+/// its shells), otherwise starts a new one. Returns `(port, token)`.
+fn connect_backend(data_dir: &Path, info_path: &Path) -> Result<(u16, String)> {
+    if let Some(info) = read_info(info_path) {
+        if let Some(status) = ping(info.port, &info.token) {
+            let outdated = status.version != APP_VERSION;
+            // An older build with nothing running is replaced; one with
+            // running shells is kept so they aren't lost.
+            if !outdated || status.shells > 0 {
+                return Ok((info.port, info.token));
+            }
+            if stop_if_idle(info.port, &info.token) {
+                wait_until(Duration::from_secs(5), || {
+                    ping(info.port, &info.token).is_none()
+                });
+            }
+        }
+    }
+    let port = pick_free_port()?;
+    let token = generate_token();
+    let pid = spawn_backend(data_dir, port, &token)?;
+    let info = BackendInfo {
+        port,
+        token: token.clone(),
+        pid,
+        version: APP_VERSION.into(),
+    };
+    write_private(info_path, &serde_json::to_string(&info)?)
+        .context("failed to write backend.json")?;
+    Ok((port, token))
+}
+
+fn start_heartbeat(port: u16, token: String) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(HEARTBEAT);
+        let _ = ping(port, &token);
+    });
+}
+
+/// On quit: stop the backend unless shells are running in it.
+fn release_backend(state: &BackendState) {
+    if stop_if_idle(state.port, &state.token) {
+        let _ = std::fs::remove_file(&state.info_path);
     }
 }
 
@@ -108,13 +298,18 @@ pub fn run() {
                     let _ = window.set_icon(icon);
                 }
             }
-            let port = pick_free_port()?;
-            let token = generate_token();
-            let child = spawn_backend(app.handle(), port, &token)?;
+            let data_dir = app
+                .path()
+                .app_local_data_dir()
+                .context("no local data dir")?;
+            std::fs::create_dir_all(&data_dir)?;
+            let info_path = data_dir.join("backend.json");
+            let (port, token) = connect_backend(&data_dir, &info_path)?;
+            start_heartbeat(port, token.clone());
             app.manage(BackendState {
                 port,
                 token,
-                child: Mutex::new(Some(child)),
+                info_path,
             });
             Ok(())
         })
@@ -129,7 +324,7 @@ pub fn run() {
             app.run(|app_handle, event| {
                 if matches!(event, RunEvent::Exit) {
                     if let Some(state) = app_handle.try_state::<BackendState>() {
-                        stop_backend(&state);
+                        release_backend(&state);
                     }
                 }
             });

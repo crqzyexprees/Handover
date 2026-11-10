@@ -91,6 +91,9 @@ pub struct Instance {
     pub mem_limit: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub custom_env_vars: BTreeMap<String, String>,
+    /// Unix seconds when it was opened; orders a project's terminals.
+    #[serde(default)]
+    pub opened_at: f64,
 }
 
 impl Instance {
@@ -242,10 +245,11 @@ mod tests {
             container_id: None,
             mem_limit: None,
             custom_env_vars: BTreeMap::new(),
+            opened_at: 1.5,
         };
         assert_eq!(
             json!(native),
-            json!({ "id": "i", "project_id": "p", "sandbox_mode": "native", "container_id": null })
+            json!({ "id": "i", "project_id": "p", "sandbox_mode": "native", "container_id": null, "opened_at": 1.5 })
         );
     }
 

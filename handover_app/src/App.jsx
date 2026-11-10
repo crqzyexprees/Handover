@@ -138,8 +138,13 @@ export default function App() {
       })
       if (!restoreToastShownRef.current && incoming.length > 0) {
         restoreToastShownRef.current = true
+        const runningTerminals = incoming.some(
+          (project) => getProjectInstances(project).length > 0,
+        )
         pushToast(
-          'Projects restored from your last session. Open a terminal to continue.',
+          runningTerminals
+            ? 'Projects restored; terminals that kept running are reattached.'
+            : 'Projects restored from your last session. Open a terminal to continue.',
           'info',
         )
       }
