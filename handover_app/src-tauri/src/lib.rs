@@ -118,7 +118,10 @@ pub fn run() {
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_backend_port, get_backend_token])
+        .invoke_handler(tauri::generate_handler![
+            get_backend_port,
+            get_backend_token
+        ])
         .build(tauri::generate_context!());
 
     match result {
