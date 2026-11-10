@@ -22,6 +22,14 @@ On the frontend, `handover_app/src/terminalSession.js` owns this whole path:
 one `TerminalSession` per terminal holds the xterm, the WebSocket, paste and
 decoding, so every keystroke and paste goes through a single write path.
 
+Shells outlive connections. The backend (`handover_rust/src/pty.rs`) keeps
+each terminal's shell running when its window disconnects and buffers recent
+output; on reconnect the window receives only what it missed, so a running
+Claude / Codex / Cursor session is never restarted by a dropped connection.
+The window reconnects automatically (up to 5 tries); ↻ forces a reattach,
+or starts a new shell if the old one exited. A shell ends only when you
+`exit` it, delete the terminal, or unload the project.
+
 If typing fails after code changes, do a **full restart** (not hot reload):
 
 ```bash

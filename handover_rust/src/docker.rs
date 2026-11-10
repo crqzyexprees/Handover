@@ -191,9 +191,15 @@ impl DockerRuntime {
             .await?;
 
         let id = create.id;
-        self.docker
+        // Never leave a created-but-unstarted container behind.
+        if let Err(e) = self
+            .docker
             .start_container(&id, None::<StartContainerOptions>)
-            .await?;
+            .await
+        {
+            let _ = self.stop_container(&id).await;
+            return Err(e).context("failed to start sandbox container");
+        }
 
         let exec = self
             .docker

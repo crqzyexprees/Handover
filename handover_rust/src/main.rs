@@ -1047,6 +1047,7 @@ async fn project_resources(
             "instance_id": instance_id,
             "label": format!("Terminal {}", index + 1),
             "sandbox_mode": inst.get("sandbox_mode"),
+            // True while the shell is running, attached window or not.
             "connected": pty_sessions.contains_key(instance_id),
             "stats": stats,
         }));
@@ -1093,13 +1094,14 @@ async fn project_resources(
 async fn ws_pty(
     ws: WebSocketUpgrade,
     Path(instance_id): Path<String>,
+    Query(params): Query<pty::AttachParams>,
     State(ctx): State<ServerCtx>,
 ) -> Result<impl IntoResponse, StatusCode> {
     if !ctx.state.instances.read().await.contains_key(&instance_id) {
         return Err(StatusCode::NOT_FOUND);
     }
     let state = ctx.state.clone();
-    Ok(ws.on_upgrade(move |socket| pty::handle_pty_socket(socket, instance_id, state)))
+    Ok(ws.on_upgrade(move |socket| pty::handle_pty_socket(socket, instance_id, params, state)))
 }
 
 #[tokio::main]

@@ -6,7 +6,9 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::fs;
-use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, RwLock};
+
+use crate::pty::PtySession;
 
 pub const DEFAULT_MEM_LIMIT: &str = "2g";
 pub const SANDBOX_MODES: &[&str] = &["docker", "native"];
@@ -17,26 +19,14 @@ pub const GOVERNOR_INTERVAL_SECS: u64 = 15;
 pub const RAM_SUSPEND_THRESHOLD: f32 = 85.0;
 pub const RAM_EMERGENCY_THRESHOLD: f32 = 95.0;
 
-#[derive(Clone)]
-pub struct PtySession {
-    pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    /// Shell / docker-exec PID for native resource accounting.
-    pub shell_pid: Option<u32>,
-    /// Unique per spawned shell, so a finishing WebSocket loop only removes
-    /// its own entry and never a newer session for the same instance.
-    pub session_id: u64,
-    /// Signalled to make the owning WebSocket loop exit and kill the child.
-    pub kill: Arc<Notify>,
-}
-
 pub struct AppState {
     pub projects: RwLock<HashMap<String, Value>>,
     pub project_configs: RwLock<HashMap<String, Value>>,
     pub instances: RwLock<HashMap<String, Value>>,
-    /// Serializes PTY setup per instance (held only while spawning, never
-    /// for the lifetime of a session).
+    /// Serializes shell startup per instance (held only while spawning).
     pub ws_session_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    pub pty_sessions: RwLock<HashMap<String, PtySession>>,
+    /// Running shells by instance id; they outlive client connections.
+    pub pty_sessions: RwLock<HashMap<String, Arc<PtySession>>>,
     pub focused_project_id: RwLock<Option<String>>,
     pub project_last_active: RwLock<HashMap<String, f64>>,
     pub app_config: RwLock<Value>,

@@ -1,4 +1,19 @@
-use std::collections::HashMap;
+//! Terminal sessions: one long-lived shell per Instance.
+//!
+//! The shell belongs to the Instance, not to a WebSocket. A client *attaches*
+//! to the running shell and *detaches* when its socket closes; the shell keeps
+//! running. Recent output is kept in an [`OutputLog`] so a client that
+//! reconnects can catch up on what it missed.
+//!
+//! Wire protocol on `/ws/pty/{id}?session=<id>&since=<offset>`:
+//! - client → server text: keystrokes, or `__handover_control__:{"type":"resize",...}`
+//! - server → client text: terminal output, or `__handover_control__:{json}` with
+//!   `type` one of `attached {session, from}`, `exit`, `replaced`, `error {message}`.
+//!
+//! Offsets count UTF-16 code units of output text, which is what a browser's
+//! `string.length` measures, so client and server agree on positions.
+
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,15 +21,20 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket};
+use futures::stream::SplitSink;
 use futures::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Deserialize;
-use tokio::sync::{mpsc, Mutex, Notify};
+use serde_json::json;
+use tokio::sync::{broadcast, mpsc, Mutex, Notify};
 use tracing::warn;
 
-use crate::state::{AppState, PtySession};
+use crate::state::AppState;
 
 const CONTROL_PREFIX: &str = "__handover_control__:";
+
+/// Output kept for replay, in UTF-16 code units (~2 MB of text).
+const OUTPUT_LOG_CAP: u64 = 1_000_000;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -25,118 +45,222 @@ enum PtyControl {
     Resize { cols: u16, rows: u16 },
 }
 
-/// Mirrors the original Python backend: one WebSocket ↔ one PTY ↔ one shell.
-pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Arc<AppState>) {
-    let (mut ws_tx, mut ws_rx) = socket.split();
+/// Query parameters a client sends when attaching.
+#[derive(Debug, Default, Deserialize)]
+pub struct AttachParams {
+    /// Session the client last saw output from.
+    pub session: Option<u64>,
+    /// Offset (UTF-16 units) of the end of the output the client already has.
+    pub since: Option<u64>,
+}
 
-    async fn send_error(ws_tx: &mut futures::stream::SplitSink<WebSocket, Message>, message: &str) {
-        let _ = ws_tx
-            .send(Message::Text(Utf8Bytes::from(format!(
-                "\r\n\x1b[31m[handover] {message}\x1b[0m\r\n"
-            ))))
-            .await;
+// ── Output log ─────────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct Chunk {
+    start: u64,
+    text: Arc<str>,
+}
+
+#[derive(Clone, Debug)]
+enum Event {
+    Output(Chunk),
+    Exited,
+}
+
+fn utf16_len(s: &str) -> u64 {
+    s.encode_utf16().count() as u64
+}
+
+/// Bounded history of a session's output plus a live feed of new output.
+/// Pushes and subscriptions happen under the same lock, so a subscriber's
+/// replay and its live feed never overlap or leave a gap.
+pub struct OutputLog {
+    chunks: VecDeque<Chunk>,
+    start: u64,
+    end: u64,
+    cap: u64,
+    exited: bool,
+    tx: broadcast::Sender<Event>,
+}
+
+impl OutputLog {
+    fn new(cap: u64) -> Self {
+        let (tx, _) = broadcast::channel(1024);
+        Self {
+            chunks: VecDeque::new(),
+            start: 0,
+            end: 0,
+            cap,
+            exited: false,
+            tx,
+        }
     }
 
-    let (sandbox_mode, container_id, cwd, env_vars) = {
-        let instances = state.instances.read().await;
-        let instance = match instances.get(&instance_id) {
-            Some(i) => i.clone(),
-            None => {
-                send_error(
-                    &mut ws_tx,
-                    "Instance not found. Close this terminal and open a new one.",
-                )
-                .await;
-                return;
-            }
+    fn push(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        let chunk = Chunk {
+            start: self.end,
+            text: Arc::from(text),
         };
-        let mode = instance
-            .get("sandbox_mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("docker")
-            .to_string();
-        let env_vars: HashMap<String, String> = instance
-            .get("custom_env_vars")
-            .and_then(|v| v.as_object())
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let cid = instance
-            .get("container_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let project_path = if let Some(pid) = instance.get("project_id").and_then(|v| v.as_str()) {
-            let projects = state.projects.read().await;
-            projects
-                .get(pid)
-                .and_then(|p| p.get("path").and_then(|v| v.as_str()).map(String::from))
-        } else {
-            None
+        self.end += utf16_len(&chunk.text);
+        self.chunks.push_back(chunk.clone());
+        while self.end - self.start > self.cap && self.chunks.len() > 1 {
+            let dropped = self.chunks.pop_front().expect("len > 1");
+            self.start = dropped.start + utf16_len(&dropped.text);
+        }
+        let _ = self.tx.send(Event::Output(chunk));
+    }
+
+    fn mark_exited(&mut self) {
+        self.exited = true;
+        let _ = self.tx.send(Event::Exited);
+    }
+
+    /// Chunks after `since` (or everything kept, if `since` is unknown or
+    /// already trimmed away), the offset they start from, and a live feed
+    /// that continues exactly where the replay ends.
+    fn subscribe_since(&self, since: Option<u64>) -> (u64, Vec<Chunk>, broadcast::Receiver<Event>) {
+        let from = match since {
+            Some(s) if s >= self.start && s <= self.end => s,
+            _ => self.start,
         };
-        let cwd = project_path
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(PathBuf::from)
-                    .filter(|p| p.is_dir())
+        let replay = self
+            .chunks
+            .iter()
+            .filter(|c| c.start >= from)
+            .cloned()
+            .collect();
+        (from, replay, self.tx.subscribe())
+    }
+}
+
+// ── Session ────────────────────────────────────────────────────────────────
+
+/// A running shell for one Instance. Lives until the shell exits or the
+/// Instance is deleted, independent of any client connection.
+pub struct PtySession {
+    pub session_id: u64,
+    pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// Shell / docker-exec PID for native resource accounting.
+    pub shell_pid: Option<u32>,
+    master: Arc<std::sync::Mutex<Box<dyn MasterPty + Send>>>,
+    log: Arc<std::sync::Mutex<OutputLog>>,
+    kill_tx: std::sync::mpsc::SyncSender<()>,
+    /// The attached client, signalled when another client takes over.
+    client: std::sync::Mutex<Option<Arc<Notify>>>,
+}
+
+impl PtySession {
+    fn kill(&self) {
+        let _ = self.kill_tx.try_send(());
+    }
+
+    fn resize(&self, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 {
+            return;
+        }
+        if let Ok(master) = self.master.lock() {
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
             });
-        (mode, cid, cwd, env_vars)
-    };
-
-    if sandbox_mode == "docker" && container_id.as_deref().unwrap_or("").is_empty() {
-        send_error(
-            &mut ws_tx,
-            "Docker container is not running for this terminal. Try closing and reopening it.",
-        )
-        .await;
-        return;
+        }
     }
 
-    let session_lock = {
-        let mut locks = state.ws_session_locks.lock().await;
-        locks
-            .entry(instance_id.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    fn is_exited(&self) -> bool {
+        self.log.lock().map(|l| l.exited).unwrap_or(true)
+    }
+}
+
+struct SpawnTarget {
+    sandbox_mode: String,
+    container_id: Option<String>,
+    cwd: Option<PathBuf>,
+    env_vars: HashMap<String, String>,
+}
+
+/// Reads what is needed to start this instance's shell.
+async fn spawn_target(state: &AppState, instance_id: &str) -> Result<SpawnTarget, String> {
+    let instance = state
+        .instances
+        .read()
+        .await
+        .get(instance_id)
+        .cloned()
+        .ok_or("Instance not found. Close this terminal and open a new one.")?;
+    let sandbox_mode = instance
+        .get("sandbox_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("docker")
+        .to_string();
+    let container_id = instance
+        .get("container_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if sandbox_mode == "docker" && container_id.is_none() {
+        return Err(
+            "Docker container is not running for this terminal. Try closing and reopening it."
+                .into(),
+        );
+    }
+    let env_vars: HashMap<String, String> = instance
+        .get("custom_env_vars")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let project_path = match instance.get("project_id").and_then(|v| v.as_str()) {
+        Some(pid) => state
+            .projects
+            .read()
+            .await
+            .get(pid)
+            .and_then(|p| p.get("path").and_then(|v| v.as_str()).map(String::from)),
+        None => None,
     };
-    // Held only during setup. The previous session (if any) is told to exit
-    // instead of being waited on, so a half-open old socket can't block a
-    // reconnect.
-    let session_guard = session_lock.lock().await;
+    let cwd = project_path
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+        });
+    Ok(SpawnTarget {
+        sandbox_mode,
+        container_id,
+        cwd,
+        env_vars,
+    })
+}
 
-    stop_pty_session(&state, &instance_id).await;
-
-    let sandbox_mode_clone = sandbox_mode.clone();
-    let container_id_clone = container_id.clone();
-    let cwd_clone = cwd.clone();
-
-    let handles = match tokio::task::spawn_blocking(move || {
+/// Starts a shell and the tasks that pump its input and output.
+async fn spawn_session(
+    state: &Arc<AppState>,
+    instance_id: &str,
+    target: SpawnTarget,
+) -> Result<Arc<PtySession>, String> {
+    let handles = tokio::task::spawn_blocking(move || {
         spawn_pty_child(
-            &sandbox_mode_clone,
-            container_id_clone.as_deref(),
-            cwd_clone.as_deref(),
-            &env_vars,
+            &target.sandbox_mode,
+            target.container_id.as_deref(),
+            target.cwd.as_deref(),
+            &target.env_vars,
         )
     })
     .await
-    {
-        Ok(Ok(h)) => h,
-        Ok(Err(e)) => {
-            warn!("pty spawn failed: {e}");
-            send_error(&mut ws_tx, &format!("Failed to start shell: {e}")).await;
-            return;
-        }
-        Err(e) => {
-            warn!("pty spawn task failed: {e}");
-            send_error(&mut ws_tx, "Failed to start shell").await;
-            return;
-        }
-    };
+    .map_err(|e| format!("Failed to start shell: {e}"))?
+    .map_err(|e| format!("Failed to start shell: {e}"))?;
 
     let PtyHandles {
         reader,
@@ -145,78 +269,231 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
         child,
     } = handles;
 
-    let shell_pid = child.process_id();
-    let master = Arc::new(std::sync::Mutex::new(master));
-    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (read_tx, mut read_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-    let kill = Arc::new(Notify::new());
+    let shell_pid = child.process_id();
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (kill_tx, kill_rx) = std::sync::mpsc::sync_channel::<()>(1);
+    let log = Arc::new(std::sync::Mutex::new(OutputLog::new(OUTPUT_LOG_CAP)));
 
-    state.pty_sessions.write().await.insert(
-        instance_id.clone(),
-        PtySession {
-            input_tx: write_tx.clone(),
-            shell_pid,
-            session_id,
-            kill: kill.clone(),
-        },
-    );
-    drop(session_guard);
-
-    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::sync_channel::<()>(1);
-
-    let writer_handle = tokio::task::spawn_blocking(move || {
+    // Input: channel → PTY writer. Ends when every sender is dropped.
+    tokio::task::spawn_blocking(move || {
         let mut writer = writer;
-        while let Some(data) = write_rx.blocking_recv() {
+        while let Some(data) = input_rx.blocking_recv() {
             if writer.write_all(&data).is_err() {
                 break;
             }
         }
     });
 
-    let reader_handle = tokio::task::spawn_blocking(move || {
-        let mut reader = reader;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if read_tx.send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let _child_handle = tokio::task::spawn_blocking(move || {
+    // Child: killed on request (delete) or reaped after it exits on its own.
+    tokio::task::spawn_blocking(move || {
         let mut child = child;
-        let _ = shutdown_rx.recv();
+        let _ = kill_rx.recv();
         let _ = child.kill();
         let _ = child.wait();
     });
 
-    // Bytes of a UTF-8 character split across PTY reads, carried to the next read.
-    let mut pending_utf8: Vec<u8> = Vec::new();
+    // Output: PTY reader → bytes channel → decoded into the log.
+    let (bytes_tx, mut bytes_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::task::spawn_blocking(move || {
+        let mut reader = reader;
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if bytes_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 
-    loop {
+    let session = Arc::new(PtySession {
+        session_id,
+        input_tx,
+        shell_pid,
+        master: Arc::new(std::sync::Mutex::new(master)),
+        log: log.clone(),
+        kill_tx: kill_tx.clone(),
+        client: std::sync::Mutex::new(None),
+    });
+
+    let pump_state = state.clone();
+    let pump_instance = instance_id.to_string();
+    tokio::spawn(async move {
+        let mut pending = Vec::new();
+        while let Some(bytes) = bytes_rx.recv().await {
+            pending.extend_from_slice(&bytes);
+            let text = drain_utf8(&mut pending);
+            if let Ok(mut log) = log.lock() {
+                log.push(text);
+            }
+        }
+        // Shell exited (or was killed): tell clients, reap, and forget it so
+        // the next attach starts a fresh shell.
+        if let Ok(mut log) = log.lock() {
+            log.mark_exited();
+        }
+        let _ = kill_tx.try_send(());
+        let mut sessions = pump_state.pty_sessions.write().await;
+        if sessions.get(&pump_instance).map(|s| s.session_id) == Some(session_id) {
+            sessions.remove(&pump_instance);
+        }
+    });
+
+    Ok(session)
+}
+
+/// The instance's running shell, starting one if there is none.
+async fn get_or_spawn_session(
+    state: &Arc<AppState>,
+    instance_id: &str,
+) -> Result<Arc<PtySession>, String> {
+    let setup_lock = state
+        .ws_session_locks
+        .lock()
+        .await
+        .entry(instance_id.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone();
+    let _guard = setup_lock.lock().await;
+
+    if let Some(existing) = state.pty_sessions.read().await.get(instance_id) {
+        if !existing.is_exited() {
+            return Ok(existing.clone());
+        }
+    }
+    let target = spawn_target(state, instance_id).await?;
+    let session = spawn_session(state, instance_id, target).await?;
+    state
+        .pty_sessions
+        .write()
+        .await
+        .insert(instance_id.to_string(), session.clone());
+    Ok(session)
+}
+
+/// Called when an instance is deleted or its project unloaded: kills the
+/// shell (attached clients receive `exit`) and forgets the setup lock.
+pub async fn shutdown_instance_pty(state: &AppState, instance_id: &str) {
+    if let Some(session) = state.pty_sessions.write().await.remove(instance_id) {
+        session.kill();
+    }
+    state.ws_session_locks.lock().await.remove(instance_id);
+}
+
+// ── Attaching a client ─────────────────────────────────────────────────────
+
+type WsTx = SplitSink<WebSocket, Message>;
+
+async fn send_control(ws_tx: &mut WsTx, value: serde_json::Value) -> bool {
+    ws_tx
+        .send(Message::Text(Utf8Bytes::from(format!(
+            "{CONTROL_PREFIX}{value}"
+        ))))
+        .await
+        .is_ok()
+}
+
+/// Sends output text. A chunk that happens to begin with the control prefix
+/// is split so the client can't mistake it for a control frame; the bytes
+/// and offsets are unchanged.
+async fn send_output(ws_tx: &mut WsTx, text: &str) -> bool {
+    if text.starts_with(CONTROL_PREFIX) {
+        let (head, tail) = text.split_at(1);
+        return ws_tx
+            .send(Message::Text(Utf8Bytes::from(head)))
+            .await
+            .is_ok()
+            && ws_tx
+                .send(Message::Text(Utf8Bytes::from(tail)))
+                .await
+                .is_ok();
+    }
+    ws_tx
+        .send(Message::Text(Utf8Bytes::from(text)))
+        .await
+        .is_ok()
+}
+
+/// Attaches one WebSocket client to the instance's shell until the client
+/// leaves, another client takes over, or the shell exits. Never kills the
+/// shell.
+pub async fn handle_pty_socket(
+    socket: WebSocket,
+    instance_id: String,
+    params: AttachParams,
+    state: Arc<AppState>,
+) {
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    let session = match get_or_spawn_session(&state, &instance_id).await {
+        Ok(s) => s,
+        Err(message) => {
+            warn!("pty attach failed for {instance_id}: {message}");
+            let _ = send_control(&mut ws_tx, json!({ "type": "error", "message": message })).await;
+            return;
+        }
+    };
+
+    // Newest client wins; the previous one is told it was replaced.
+    let kicked = Arc::new(Notify::new());
+    if let Ok(mut client) = session.client.lock() {
+        if let Some(previous) = client.replace(kicked.clone()) {
+            previous.notify_one();
+        }
+    }
+
+    let since = match params.session {
+        Some(id) if id == session.session_id => params.since,
+        _ => None,
+    };
+    let (from, replay, mut feed, exited) = {
+        let log = session.log.lock().expect("output log poisoned");
+        let (from, replay, feed) = log.subscribe_since(since);
+        (from, replay, feed, log.exited)
+    };
+
+    let mut sent_to = from;
+    let mut ok = send_control(
+        &mut ws_tx,
+        json!({ "type": "attached", "session": session.session_id, "from": from }),
+    )
+    .await;
+    for chunk in &replay {
+        if !ok {
+            break;
+        }
+        ok = send_output(&mut ws_tx, &chunk.text).await;
+        sent_to = chunk.start + utf16_len(&chunk.text);
+    }
+    if ok && exited {
+        let _ = send_control(&mut ws_tx, json!({ "type": "exit" })).await;
+        ok = false;
+    }
+
+    while ok {
         tokio::select! {
-            _ = kill.notified() => break,
+            _ = kicked.notified() => {
+                let _ = send_control(&mut ws_tx, json!({ "type": "replaced" })).await;
+                break;
+            }
             msg = ws_rx.next() => {
                 let Some(Ok(msg)) = msg else { break };
                 match msg {
                     Message::Text(text) => {
                         if let Some(control) = text.strip_prefix(CONTROL_PREFIX) {
-                            handle_control_message(control, &master);
-                            continue;
-                        }
-                        if write_tx.send(text.as_bytes().to_vec()).is_err() {
+                            if let Ok(PtyControl::Resize { cols, rows }) = serde_json::from_str(control) {
+                                session.resize(cols, rows);
+                            }
+                        } else if session.input_tx.send(text.as_bytes().to_vec()).is_err() {
                             break;
                         }
                     }
                     Message::Binary(data) => {
-                        if write_tx.send(data.to_vec()).is_err() {
+                        if session.input_tx.send(data.to_vec()).is_err() {
                             break;
                         }
                     }
@@ -224,44 +501,48 @@ pub async fn handle_pty_socket(socket: WebSocket, instance_id: String, state: Ar
                     _ => {}
                 }
             }
-            out = read_rx.recv() => {
-                let Some(data) = out else { break };
-                // Python backend used send_text — match that on the wire
-                pending_utf8.extend_from_slice(&data);
-                let text = drain_utf8(&mut pending_utf8);
-                if text.is_empty() {
-                    continue;
+            event = feed.recv() => match event {
+                Ok(Event::Output(chunk)) => {
+                    if !send_output(&mut ws_tx, &chunk.text).await {
+                        break;
+                    }
+                    sent_to = chunk.start + utf16_len(&chunk.text);
                 }
-                if ws_tx.send(Message::Text(Utf8Bytes::from(text))).await.is_err() {
+                Ok(Event::Exited) | Err(broadcast::error::RecvError::Closed) => {
+                    let _ = send_control(&mut ws_tx, json!({ "type": "exit" })).await;
                     break;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Client fell behind the live feed: resync from the log.
+                    let (from, replay, new_feed) = {
+                        let log = session.log.lock().expect("output log poisoned");
+                        log.subscribe_since(Some(sent_to))
+                    };
+                    feed = new_feed;
+                    if from != sent_to {
+                        let attached = json!({ "type": "attached", "session": session.session_id, "from": from });
+                        if !send_control(&mut ws_tx, attached).await {
+                            break;
+                        }
+                    }
+                    sent_to = from;
+                    for chunk in &replay {
+                        if !send_output(&mut ws_tx, &chunk.text).await {
+                            ok = false;
+                            break;
+                        }
+                        sent_to = chunk.start + utf16_len(&chunk.text);
+                    }
                 }
             }
         }
     }
 
-    drop(write_tx);
-    let _ = shutdown_tx.send(());
-    writer_handle.abort();
-    reader_handle.abort();
-    let mut sessions = state.pty_sessions.write().await;
-    if sessions.get(&instance_id).map(|s| s.session_id) == Some(session_id) {
-        sessions.remove(&instance_id);
+    // Detach only; the shell keeps running for the next client.
+    let mut client = session.client.lock().unwrap_or_else(|e| e.into_inner());
+    if client.as_ref().is_some_and(|c| Arc::ptr_eq(c, &kicked)) {
+        *client = None;
     }
-}
-
-/// Ends the instance's current shell (if any): its WebSocket loop exits and
-/// the child process is killed.
-async fn stop_pty_session(state: &AppState, instance_id: &str) {
-    if let Some(session) = state.pty_sessions.write().await.remove(instance_id) {
-        session.kill.notify_one();
-    }
-}
-
-/// Called when an instance is deleted or its project unloaded: kills the
-/// shell and forgets the per-instance setup lock.
-pub async fn shutdown_instance_pty(state: &AppState, instance_id: &str) {
-    stop_pty_session(state, instance_id).await;
-    state.ws_session_locks.lock().await.remove(instance_id);
 }
 
 /// Decodes the longest valid UTF-8 prefix of `pending`, leaving an incomplete
@@ -291,30 +572,6 @@ fn drain_utf8(pending: &mut Vec<u8>) -> String {
                         return out;
                     }
                 }
-            }
-        }
-    }
-}
-
-fn handle_control_message(
-    payload: &str,
-    master: &Arc<std::sync::Mutex<Box<dyn MasterPty + Send>>>,
-) {
-    let Ok(control) = serde_json::from_str::<PtyControl>(payload) else {
-        return;
-    };
-    match control {
-        PtyControl::Resize { cols, rows } => {
-            if cols == 0 || rows == 0 {
-                return;
-            }
-            if let Ok(master) = master.lock() {
-                let _ = master.resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
             }
         }
     }
@@ -377,7 +634,7 @@ fn spawn_pty_child(
 
 #[cfg(test)]
 mod tests {
-    use super::drain_utf8;
+    use super::*;
 
     #[test]
     fn drain_utf8_keeps_split_character_for_next_read() {
@@ -395,5 +652,58 @@ mod tests {
         let mut pending = vec![b'x', 0xFF, b'y'];
         assert_eq!(drain_utf8(&mut pending), "x\u{FFFD}y");
         assert!(pending.is_empty());
+    }
+
+    fn texts(chunks: &[Chunk]) -> String {
+        chunks.iter().map(|c| c.text.as_ref()).collect()
+    }
+
+    #[test]
+    fn output_log_replays_only_what_the_client_missed() {
+        let mut log = OutputLog::new(1_000);
+        log.push("hello ".into());
+        log.push("world".into());
+        let (from, replay, _) = log.subscribe_since(Some(6));
+        assert_eq!(from, 6);
+        assert_eq!(texts(&replay), "world");
+        let (from, replay, _) = log.subscribe_since(None);
+        assert_eq!(from, 0);
+        assert_eq!(texts(&replay), "hello world");
+    }
+
+    #[test]
+    fn output_log_offsets_count_utf16_units() {
+        let mut log = OutputLog::new(1_000);
+        log.push("→😀".into()); // 1 + 2 UTF-16 units
+        log.push("x".into());
+        let (from, replay, _) = log.subscribe_since(Some(3));
+        assert_eq!(from, 3);
+        assert_eq!(texts(&replay), "x");
+    }
+
+    #[test]
+    fn output_log_trims_to_cap_and_replays_from_oldest_kept() {
+        let mut log = OutputLog::new(10);
+        log.push("aaaaaa".into());
+        log.push("bbbbbb".into());
+        log.push("cc".into());
+        let (from, replay, _) = log.subscribe_since(Some(0)); // trimmed away
+        assert_eq!(from, 6);
+        assert_eq!(texts(&replay), "bbbbbbcc");
+    }
+
+    #[test]
+    fn output_log_feed_continues_after_replay() {
+        let mut log = OutputLog::new(1_000);
+        log.push("old".into());
+        let (_, replay, mut feed) = log.subscribe_since(None);
+        log.push("new".into());
+        log.mark_exited();
+        assert_eq!(texts(&replay), "old");
+        match feed.try_recv().unwrap() {
+            Event::Output(c) => assert_eq!((c.start, c.text.as_ref()), (3, "new")),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(feed.try_recv().unwrap(), Event::Exited));
     }
 }

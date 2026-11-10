@@ -6,9 +6,16 @@
  * Every byte the user sends goes through `term.onData` → `#send`, so there is
  * exactly one write path. A registry keyed by instance id guarantees at most
  * one live session per instance across React remounts and HMR.
+ *
+ * The backend shell outlives the socket. The session remembers which shell
+ * it is showing and how much of its output it has (`#offset`, in string
+ * length units), and on reconnect asks only for what it missed, so a
+ * dropped connection never restarts the running CLI. See handover_rust/src/pty.rs.
  */
 const CONTROL_PREFIX = '__handover_control__:'
 const REGISTRY_KEY = '__handover_terminal_sessions__'
+const MAX_AUTO_RECONNECTS = 5
+const RECONNECT_BASE_MS = 500
 
 export const TERMINAL_OPTIONS = {
   cursorBlink: true,
@@ -51,6 +58,8 @@ export function disposeAllTerminalSessions() {
  * @property {typeof WebSocket} WebSocket
  * @property {typeof ResizeObserver | null} ResizeObserver
  * @property {(path: string) => string} wsUrl
+ * @property {typeof setTimeout} [setTimeout]
+ * @property {typeof clearTimeout} [clearTimeout]
  */
 
 /** @type {SessionDeps} */
@@ -72,6 +81,14 @@ export class TerminalSession {
   #statusListeners = new Set()
   #disposed = false
   #decoder = new TextDecoder()
+  /** Backend shell this terminal shows, from the server's `attached` frame. */
+  #shellSession = null
+  /** How much of that shell's output this terminal has (string length units). */
+  #offset = 0
+  /** Why the server ended the connection ('exit' | 'replaced' | 'error'); suppresses auto-reconnect. */
+  #endReason = null
+  #retries = 0
+  #retryTimer = null
 
   /**
    * @param {object} opts
@@ -140,10 +157,15 @@ export class TerminalSession {
     this.#term.paste(text)
   }
 
-  /** Reopen the PTY socket, keeping xterm and its scrollback. */
+  /**
+   * Reattach to the instance's shell, keeping xterm and its scrollback. If
+   * the shell has exited, the backend starts a new one.
+   */
   reconnect() {
     if (this.#disposed) return
-    this.#term.write('\r\n\x1b[90m[handover] reconnecting…\x1b[0m\r\n')
+    this.#cancelRetry()
+    this.#retries = 0
+    this.#endReason = null
     this.#connect()
   }
 
@@ -170,6 +192,7 @@ export class TerminalSession {
   dispose() {
     if (this.#disposed) return
     this.#disposed = true
+    this.#cancelRetry()
     this.#closeSocket()
     for (const d of this.#disposables) d.dispose()
     this.#disposables = []
@@ -211,12 +234,72 @@ export class TerminalSession {
     if (ws.readyState === OPEN || ws.readyState === CONNECTING) ws.close()
   }
 
+  #note(text, color = 90) {
+    this.#term.write(`\r\n\x1b[${color}m[handover] ${text}\x1b[0m\r\n`)
+  }
+
+  #write(text) {
+    this.#term.write(text)
+    this.#offset += text.length
+  }
+
+  #handleControl(msg) {
+    switch (msg?.type) {
+      case 'attached':
+        if (this.#shellSession !== null && msg.session !== this.#shellSession) {
+          this.#note('new shell started')
+        } else if (msg.session === this.#shellSession && msg.from > this.#offset) {
+          this.#note('some output was lost while disconnected')
+        }
+        this.#shellSession = msg.session
+        this.#offset = msg.from
+        this.#retries = 0
+        break
+      case 'exit':
+        this.#endReason = 'exit'
+        this.#note('shell exited — click ↻ to start a new one')
+        break
+      case 'replaced':
+        this.#endReason = 'replaced'
+        this.#note('terminal opened in another window — click ↻ to take it back')
+        break
+      case 'error':
+        this.#endReason = 'error'
+        this.#note(msg.message ?? 'terminal error', 31)
+        break
+      default:
+        break
+    }
+  }
+
+  #cancelRetry() {
+    if (this.#retryTimer === null) return
+    ;(this.#deps.clearTimeout ?? clearTimeout)(this.#retryTimer)
+    this.#retryTimer = null
+  }
+
+  /** Reconnect after an unexpected drop, backing off; the shell keeps running meanwhile. */
+  #scheduleRetry() {
+    if (this.#disposed || this.#endReason !== null || this.#retryTimer !== null) return
+    if (this.#retries >= MAX_AUTO_RECONNECTS) return
+    const delay = RECONNECT_BASE_MS * 2 ** this.#retries
+    this.#retries += 1
+    this.#retryTimer = (this.#deps.setTimeout ?? setTimeout)(() => {
+      this.#retryTimer = null
+      if (!this.#disposed) this.#connect()
+    }, delay)
+  }
+
   #connect() {
     this.#closeSocket()
     this.#decoder = new TextDecoder()
     this.#setStatus('connecting')
 
-    const url = this.#deps.wsUrl(`/ws/pty/${encodeURIComponent(this.#instanceId)}`)
+    let path = `/ws/pty/${encodeURIComponent(this.#instanceId)}`
+    if (this.#shellSession !== null) {
+      path += `?session=${this.#shellSession}&since=${this.#offset}`
+    }
+    const url = this.#deps.wsUrl(path)
     const ws = new this.#deps.WebSocket(url)
     ws.binaryType = 'arraybuffer'
     this.#ws = ws
@@ -232,17 +315,29 @@ export class TerminalSession {
     ws.onmessage = (event) => {
       if (!current()) return
       if (typeof event.data === 'string') {
-        this.#term.write(event.data)
+        if (event.data.startsWith(CONTROL_PREFIX)) {
+          let msg = null
+          try {
+            msg = JSON.parse(event.data.slice(CONTROL_PREFIX.length))
+          } catch {
+            // malformed control frame; ignore
+          }
+          this.#handleControl(msg)
+          return
+        }
+        this.#write(event.data)
       } else if (event.data instanceof ArrayBuffer) {
         // stream: true keeps a split multi-byte character for the next chunk.
-        this.#term.write(this.#decoder.decode(event.data, { stream: true }))
+        this.#write(this.#decoder.decode(event.data, { stream: true }))
       }
     }
     ws.onerror = () => {
       if (current()) this.#setStatus('disconnected')
     }
     ws.onclose = () => {
-      if (current()) this.#setStatus('disconnected')
+      if (!current()) return
+      this.#setStatus('disconnected')
+      this.#scheduleRetry()
     }
   }
 }

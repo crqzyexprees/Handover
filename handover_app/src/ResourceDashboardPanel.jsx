@@ -160,7 +160,7 @@ export default function ResourceDashboardPanel({ open, projectId, onClose }) {
                     <tr className="border-b border-[#333333] text-[#808080]">
                       <th className="pb-2 pr-3 font-medium">Terminal</th>
                       <th className="pb-2 pr-3 font-medium">Sandbox</th>
-                      <th className="pb-2 pr-3 font-medium">Connected</th>
+                      <th className="pb-2 pr-3 font-medium">Shell running</th>
                       <th className="pb-2 pr-3 font-medium">Memory</th>
                       <th className="pb-2 font-medium">CPU</th>
                     </tr>
