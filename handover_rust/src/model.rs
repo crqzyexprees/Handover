@@ -38,16 +38,6 @@ pub enum HandoffTemplate {
     RustCli,
 }
 
-impl HandoffTemplate {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Generic => "generic",
-            Self::Nextjs => "nextjs",
-            Self::RustCli => "rust-cli",
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectState {

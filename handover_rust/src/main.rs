@@ -33,7 +33,7 @@ use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 use crate::docker::DockerRuntime;
-use crate::handoff_flow::{HandoffFailure, HandoffPlan, PromptSink};
+use crate::handoff_flow::{HandoffPlan, PromptSink};
 use crate::model::{
     HandoffMethod, Instance, ProjectConfig, ResourceStats, SandboxMode, DEFAULT_MEM_LIMIT,
 };
@@ -459,25 +459,23 @@ async fn execute_handoff(
         task: &body.task_description,
         summary_wait: handoff::HANDOFF_FILE_WAIT_TIMEOUT,
     };
-    match handoff_flow::run(plan, &ShellPrompts(&ctx.terminals)).await {
-        Ok(outcome) => Ok(Json(json!({
-            "status": "ok",
-            "kind": outcome.kind(),
-            "message": outcome.message(),
-        }))
-        .into_response()),
-        Err(f @ (HandoffFailure::NotGitRepo | HandoffFailure::SummaryTimedOut)) => Ok((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "status": "error", "kind": f.kind(), "message": f.message() })),
-        )
-            .into_response()),
-        Err(f @ (HandoffFailure::SourceNotRunning | HandoffFailure::TargetNotRunning)) => {
-            Err(api_err(StatusCode::BAD_REQUEST, f.message()))
-        }
-        Err(f @ HandoffFailure::Internal(_)) => {
-            Err(api_err(StatusCode::INTERNAL_SERVER_ERROR, f.message()))
-        }
-    }
+    // Every outcome, success or failure, has the same shape:
+    // { status: "ok" | "error", kind, message }.
+    let (status, body) = match handoff_flow::run(plan, &ShellPrompts(&ctx.terminals)).await {
+        Ok(outcome) => (
+            StatusCode::OK,
+            json!({ "status": "ok", "kind": outcome.kind(), "message": outcome.message() }),
+        ),
+        Err(f) => (
+            if f.is_internal() {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            json!({ "status": "error", "kind": f.kind(), "message": f.message() }),
+        ),
+    };
+    Ok((status, Json(body)).into_response())
 }
 
 async fn project_path_for(ctx: &ServerCtx, project_id: &str) -> Result<String, Response> {
@@ -1109,6 +1107,50 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), h.ctx.shutdown.notified())
             .await
             .expect("shutdown was not signalled");
+    }
+
+    #[tokio::test]
+    async fn handoff_failures_carry_kind_and_message() {
+        let h = harness(FakeSandbox::default()).await;
+        let pid = h.create_project().await;
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let (_, inst) = h
+                .call(
+                    "POST",
+                    "/api/instances/start",
+                    json!({ "project_id": pid, "sandbox_mode": "native" }),
+                )
+                .await;
+            ids.push(inst["id"].as_str().unwrap().to_string());
+        }
+        // Not a git repo.
+        let (status, body) = h
+            .call(
+                "POST",
+                "/api/handoff",
+                json!({ "project_id": pid, "from_instance_id": ids[0],
+                        "to_instance_id": ids[1], "method": "git",
+                        "task_description": "t" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["status"], "error");
+        assert_eq!(body["kind"], "not_git_repo");
+        // A repo, but no shell is running in the target.
+        git2::Repository::init(&h.project_dir).unwrap();
+        let (status, body) = h
+            .call(
+                "POST",
+                "/api/handoff",
+                json!({ "project_id": pid, "from_instance_id": ids[0],
+                        "to_instance_id": ids[1], "method": "git",
+                        "task_description": "t" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["kind"], "target_not_running");
+        assert!(body["message"].as_str().unwrap().contains("to_instance"));
     }
 
     #[tokio::test]

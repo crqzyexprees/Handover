@@ -39,6 +39,8 @@ pub enum HandoffOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub enum HandoffFailure {
     NotGitRepo,
+    /// The project is a git repository but the checkpoint commit failed.
+    GitFailed(String),
     /// The source AI wrote nothing in time; a goal-only fallback file was written.
     SummaryTimedOut,
     SourceNotRunning,
@@ -71,6 +73,7 @@ impl HandoffFailure {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::NotGitRepo => "not_git_repo",
+            Self::GitFailed(_) => "git_failed",
             Self::SummaryTimedOut => "summary_timed_out",
             Self::SourceNotRunning => "source_not_running",
             Self::TargetNotRunning => "target_not_running",
@@ -78,11 +81,17 @@ impl HandoffFailure {
         }
     }
 
+    /// True when the cause is ours rather than something the user can fix.
+    pub fn is_internal(&self) -> bool {
+        matches!(self, Self::Internal(_))
+    }
+
     pub fn message(&self) -> String {
         match self {
             Self::NotGitRepo => {
                 "Project is not a Git repository. Initialize git first or use Summary handoff.".into()
             }
+            Self::GitFailed(e) => format!("Git checkpoint failed: {e}"),
             Self::SummaryTimedOut => "Source AI did not create a handoff file in time. A fallback handoff file was written with only the goal you provided; review it before handing off manually.".into(),
             Self::SourceNotRunning => "from_instance does not have an active terminal session".into(),
             Self::TargetNotRunning => "to_instance does not have an active terminal session".into(),
@@ -118,15 +127,17 @@ pub async fn run(
             let outcome = match handoff::git_handoff(plan.project_path, &checkpoint).await {
                 Ok(handoff::GitHandoffOutcome::Committed) => HandoffOutcome::GitCommitted,
                 Ok(handoff::GitHandoffOutcome::NoChanges) => HandoffOutcome::GitNoChanges,
-                Err(_) => return Err(HandoffFailure::NotGitRepo),
+                Err(handoff::GitHandoffError::NotARepo) => return Err(HandoffFailure::NotGitRepo),
+                Err(handoff::GitHandoffError::Failed(e)) => {
+                    return Err(HandoffFailure::GitFailed(format!("{e:#}")))
+                }
             };
             let prompt = git_target_prompt(&outcome, plan.task);
             (outcome, prompt)
         }
         HandoffMethod::Summary => {
             let previous = handoff::latest_handoff_snapshot(plan.project_path);
-            let source_prompt =
-                handoff::build_summary_source_prompt(plan.task, plan.template.as_str());
+            let source_prompt = handoff::build_summary_source_prompt(plan.task, plan.template);
             if !sink
                 .send_prompt(plan.from_instance_id, &source_prompt)
                 .await
@@ -298,6 +309,26 @@ mod tests {
         )
         .await;
         assert_eq!(out, Err(HandoffFailure::NotGitRepo));
+        assert!(terms.sent_to().is_empty());
+    }
+
+    #[tokio::test]
+    async fn git_commit_failure_is_not_reported_as_missing_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hi").unwrap();
+        // Another git process holds the index.
+        std::fs::write(dir.path().join(".git/index.lock"), "").unwrap();
+        let terms = FakeTerminals::new(vec!["src", "dst"]);
+        let out = run(
+            plan(dir.path().to_str().unwrap(), HandoffMethod::Git, 0),
+            &terms,
+        )
+        .await;
+        match out {
+            Err(f @ HandoffFailure::GitFailed(_)) => assert_eq!(f.kind(), "git_failed"),
+            other => panic!("expected GitFailed, got {other:?}"),
+        }
         assert!(terms.sent_to().is_empty());
     }
 

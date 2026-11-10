@@ -7,6 +7,8 @@ use git2::{Repository, Signature};
 use serde::Serialize;
 use tokio::fs;
 
+use crate::model::HandoffTemplate;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct HandoffFileSnapshot {
     modified: Option<SystemTime>,
@@ -19,34 +21,57 @@ pub enum GitHandoffOutcome {
     NoChanges,
 }
 
-pub async fn git_handoff(project_path: &str, summary_text: &str) -> Result<GitHandoffOutcome> {
+#[derive(Debug)]
+pub enum GitHandoffError {
+    /// The folder isn't inside a git repository.
+    NotARepo,
+    /// The repository exists but the checkpoint commit failed
+    /// (e.g. a stale index.lock or missing permissions).
+    Failed(anyhow::Error),
+}
+
+pub async fn git_handoff(
+    project_path: &str,
+    summary_text: &str,
+) -> std::result::Result<GitHandoffOutcome, GitHandoffError> {
     let path = project_path.to_string();
     let message = summary_text.to_string();
-    let outcome = tokio::task::spawn_blocking(move || -> Result<GitHandoffOutcome> {
-        let repo = Repository::open(&path).context("not a git repository")?;
-        let mut index = repo.index()?;
-        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
-        index.update_all(["*"].iter(), None)?;
-        index.write()?;
-        let tree_id = index.write_tree()?;
-        let tree = repo.find_tree(tree_id)?;
-        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
-        if let Some(parent) = parent.as_ref() {
-            if parent.tree_id() == tree_id {
-                return Ok(GitHandoffOutcome::NoChanges);
+    tokio::task::spawn_blocking(move || {
+        let repo = match Repository::open(&path) {
+            Ok(repo) => repo,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => {
+                return Err(GitHandoffError::NotARepo)
             }
-        }
-        let sig = repo
-            .signature()
-            .or_else(|_| Signature::now("Handover", "handover@local"))?;
-        match parent {
-            Some(parent) => repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[&parent])?,
-            None => repo.commit(Some("HEAD"), &sig, &sig, &message, &tree, &[])?,
+            Err(e) => return Err(GitHandoffError::Failed(e.into())),
         };
-        Ok(GitHandoffOutcome::Committed)
+        commit_all(&repo, &message).map_err(GitHandoffError::Failed)
     })
-    .await??;
-    Ok(outcome)
+    .await
+    .map_err(|e| GitHandoffError::Failed(e.into()))?
+}
+
+/// Stages everything and commits it; `NoChanges` if the tree is unchanged.
+fn commit_all(repo: &Repository, message: &str) -> Result<GitHandoffOutcome> {
+    let mut index = repo.index()?;
+    index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+    index.update_all(["*"].iter(), None)?;
+    index.write()?;
+    let tree_id = index.write_tree()?;
+    let tree = repo.find_tree(tree_id)?;
+    let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    if let Some(parent) = parent.as_ref() {
+        if parent.tree_id() == tree_id {
+            return Ok(GitHandoffOutcome::NoChanges);
+        }
+    }
+    let sig = repo
+        .signature()
+        .or_else(|_| Signature::now("Handover", "handover@local"))?;
+    match parent {
+        Some(parent) => repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent])?,
+        None => repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[])?,
+    };
+    Ok(GitHandoffOutcome::Committed)
 }
 
 fn next_handoff_path(handoffs_dir: &Path) -> PathBuf {
@@ -144,15 +169,15 @@ pub async fn wait_for_latest_handoff(
     }
 }
 
-pub fn summary_template_instructions(template: &str) -> &'static str {
+pub fn summary_template_instructions(template: HandoffTemplate) -> &'static str {
     match template {
-        "nextjs" => "Project type: Next.js. Emphasize app router routes, API routes, React components and hooks, env vars (.env.local), and npm/pnpm scripts run or needed.",
-        "rust-cli" => "Project type: Rust CLI/backend. Emphasize crates and modules changed, public APIs, cargo commands (build/test/clippy), test output, and CLI flags or config touched.",
-        _ => "Include: current goal, project context, files changed, commands run, tests/results, decisions made, blockers, and exact next steps.",
+        HandoffTemplate::Nextjs => "Project type: Next.js. Emphasize app router routes, API routes, React components and hooks, env vars (.env.local), and npm/pnpm scripts run or needed.",
+        HandoffTemplate::RustCli => "Project type: Rust CLI/backend. Emphasize crates and modules changed, public APIs, cargo commands (build/test/clippy), test output, and CLI flags or config touched.",
+        HandoffTemplate::Generic => "Include: current goal, project context, files changed, commands run, tests/results, decisions made, blockers, and exact next steps.",
     }
 }
 
-pub fn build_summary_source_prompt(task: &str, template: &str) -> String {
+pub fn build_summary_source_prompt(task: &str, template: HandoffTemplate) -> String {
     let extra = summary_template_instructions(template);
     format!(
         "Create a handoff file for the next AI now. Write concise Markdown to '.handover/handoffs/latest.md' and also create the next numbered history file under '.handover/handoffs/' as 'handoff_NNN.md' with the same content. {extra} Overall goal: {task}. After writing the files, stop and wait."
@@ -340,15 +365,15 @@ mod tests {
 
     #[test]
     fn build_summary_source_prompt_includes_template_hints() {
-        let generic = build_summary_source_prompt("ship feature X", "generic");
+        let generic = build_summary_source_prompt("ship feature X", HandoffTemplate::Generic);
         assert!(generic.contains("files changed"));
         assert!(generic.contains("ship feature X"));
 
-        let nextjs = build_summary_source_prompt("fix login", "nextjs");
+        let nextjs = build_summary_source_prompt("fix login", HandoffTemplate::Nextjs);
         assert!(nextjs.contains("Next.js"));
         assert!(nextjs.contains("fix login"));
 
-        let rust_cli = build_summary_source_prompt("add subcommand", "rust-cli");
+        let rust_cli = build_summary_source_prompt("add subcommand", HandoffTemplate::RustCli);
         assert!(rust_cli.contains("Rust CLI"));
         assert!(rust_cli.contains("cargo commands"));
     }

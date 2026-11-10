@@ -447,12 +447,7 @@ export default function App() {
 
   const handleExecuteHandover = useCallback(
     async (payload) => {
-      const { data, error } = await api.executeHandover(payload)
-      if (error) {
-        pushToast(`Could not execute handover: ${formatApiError(error)}`, 'error')
-        return false
-      }
-      const result = api.parseHandoffResult(data)
+      const result = await api.executeHandover(payload)
       if (!result.ok) {
         pushToast(result.message, 'error', 9000)
         return false

@@ -1,5 +1,6 @@
 import axios from 'axios'
 import { getBackendBaseUrl, getBackendToken } from './platform.js'
+import { parseHandoffResult } from './handoffResult.js'
 
 export const BASE_URL = getBackendBaseUrl()
 
@@ -25,20 +26,6 @@ async function request(fn) {
       : error
     return { data: null, error: err }
   }
-}
-
-/** Normalize handoff API responses (Rust may return status:error in HTTP 200 or 400). */
-export function parseHandoffResult(data) {
-  // `kind` is set by the backend: git_committed | git_no_changes |
-  // summary_written | summary_timed_out | not_git_repo
-  const kind = data?.kind ?? null
-  if (data?.status === 'error') {
-    return { ok: false, kind, message: data.message ?? 'Handoff failed' }
-  }
-  if (data?.status === 'ok') {
-    return { ok: true, kind, message: data.message ?? 'Handover complete' }
-  }
-  return { ok: false, message: 'Unexpected handoff response' }
 }
 
 export async function listProjects() {
@@ -105,9 +92,12 @@ export async function saveProjectConfig(projectId, config) {
   })
 }
 
-/** Trigger an AI-to-AI handover (backend route: POST /api/handoff). */
+/**
+ * Trigger an AI-to-AI handover (backend route: POST /api/handoff).
+ * Resolves to `{ ok, kind, message }` (see parseHandoffResult); never throws.
+ */
 export async function executeHandover(payload) {
-  return request(async () => {
+  const { data, error } = await request(async () => {
     const res = await client.post('/api/handoff', {
       from_instance_id: payload.from_instance_id,
       to_instance_id: payload.to_instance_id,
@@ -117,6 +107,7 @@ export async function executeHandover(payload) {
     })
     return res.data
   })
+  return parseHandoffResult(error ?? data)
 }
 
 export async function stopInstance(id) {
