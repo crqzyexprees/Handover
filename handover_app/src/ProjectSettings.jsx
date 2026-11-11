@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import * as api from './api.js'
 
 /** The form's fields, from a config the backend sent. */
-function formFromConfig(config) {
+function formFromConfig(config, fallbackName) {
   return {
-    project_name: config.project_name,
+    project_name: config.project_name?.trim() || fallbackName,
     sandbox_mode: config.sandbox_mode,
     mem_limit: config.mem_limit,
     handoff_method: config.handoff_method,
@@ -96,14 +96,25 @@ export default function ProjectSettings({
   onClose,
   focusedProjectId,
   initialConfig,
+  fallbackName = '',
   onSaveConfig,
 }) {
   // Mounted per open (see App), so the project's config seeds the form;
   // a fresh read below picks up hand edits to `.handover/config.yml`.
-  const [config, setConfig] = useState(() => formFromConfig(initialConfig))
-  const [customEnvVars, setCustomEnvVars] = useState(() =>
+  const [config, setFormConfig] = useState(() => formFromConfig(initialConfig, fallbackName))
+  const [customEnvVars, setFormEnvVars] = useState(() =>
     dictToCustomEnvVars(initialConfig.custom_env_vars),
   )
+  // Once the user edits, the fresh read below must not overwrite the form.
+  const editedRef = useRef(false)
+  const setConfig = (update) => {
+    editedRef.current = true
+    setFormConfig(update)
+  }
+  const setCustomEnvVars = (update) => {
+    editedRef.current = true
+    setFormEnvVars(update)
+  }
   const [isSaving, setIsSaving] = useState(false)
   const [errorText, setErrorText] = useState('')
 
@@ -122,18 +133,18 @@ export default function ProjectSettings({
     if (focusedProjectId == null) return
     let ignore = false
     void api.getProjectConfig(focusedProjectId).then(({ data, error }) => {
-      if (ignore) return
+      if (ignore || editedRef.current) return
       if (error) {
         setErrorText('Could not load the latest project settings.')
         return
       }
-      setConfig(formFromConfig(data))
-      setCustomEnvVars(dictToCustomEnvVars(data.custom_env_vars))
+      setFormConfig(formFromConfig(data, fallbackName))
+      setFormEnvVars(dictToCustomEnvVars(data.custom_env_vars))
     })
     return () => {
       ignore = true
     }
-  }, [focusedProjectId])
+  }, [fallbackName, focusedProjectId])
 
   if (!isOpen) return null
 

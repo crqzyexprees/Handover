@@ -35,15 +35,26 @@ describe('projectReducer', () => {
     expect(s.focusedInstanceId).toBe('i1')
   })
 
-  it('an opened instance joins its project and takes focus', () => {
+  it('an opened instance in the focused project takes focus', () => {
     const s = run(
-      a.loaded([project('p1', ['i1']), project('p2')]),
+      a.loaded([project('p1', ['i1'])]),
       a.projectFocused('p1'),
-      a.instanceOpened(inst('i9', 'p2')),
+      a.instanceOpened(inst('i9', 'p1')),
     )
-    expect(s.projects[1].instances.map((i) => i.id)).toEqual(['i9'])
-    expect(s.focusedProjectId).toBe('p2')
+    expect(s.projects[0].instances.map((i) => i.id)).toEqual(['i1', 'i9'])
     expect(s.focusedInstanceId).toBe('i9')
+  })
+
+  it('an instance that finishes starting after the user moved on does not steal focus', () => {
+    const s = run(
+      a.loaded([project('p1'), project('p2', ['i2'])]),
+      a.projectFocused('p1'),
+      a.projectFocused('p2'),
+      a.instanceOpened(inst('i9', 'p1')),
+    )
+    expect(s.projects[0].instances.map((i) => i.id)).toEqual(['i9'])
+    expect(s.focusedProjectId).toBe('p2')
+    expect(s.focusedInstanceId).toBe('i2')
   })
 
   it('opening the same instance twice adds it once', () => {

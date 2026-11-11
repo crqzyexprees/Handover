@@ -144,11 +144,11 @@ export default function App() {
       pushToast(`Could not activate project: ${formatApiError(error)}`, 'error')
       return
     }
+    // The backend now has it focused; follow it even if the reload fails.
+    dispatch(projectActions.projectFocused(projectId))
     const refreshed = await refreshProjects()
     const selected = refreshed?.find((p) => p.id === projectId)
-    if (!selected) return
-    dispatch(projectActions.projectFocused(projectId))
-    if (selected.instances.length === 0) {
+    if (selected && selected.instances.length === 0) {
       await startInstanceForProject(projectId)
     }
   }, [pushToast, refreshProjects, startInstanceForProject])
@@ -183,6 +183,7 @@ export default function App() {
           pushToast(`Could not activate project: ${formatApiError(error)}`, 'error')
           return
         }
+        dispatch(projectActions.projectFocused(projectId))
       }
       await handleFocusInstance(instanceId)
     },
@@ -350,6 +351,7 @@ export default function App() {
           onClose={() => setIsSettingsModalOpen(false)}
           focusedProjectId={settingsProject.id}
           initialConfig={settingsProject.config}
+          fallbackName={getProjectDisplayName(settingsProject)}
           onSaveConfig={handleSaveProjectConfig}
         />
       ) : null}

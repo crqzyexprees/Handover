@@ -22,7 +22,11 @@ export const projectActions = {
   projectAdded: (project) => ({ type: 'projectAdded', project }),
   /** Focus a Project and its first Instance (if any). */
   projectFocused: (projectId) => ({ type: 'projectFocused', projectId }),
-  /** A new Instance from POST /api/instances/start; it takes focus. */
+  /**
+   * A new Instance from POST /api/instances/start. It takes focus only if
+   * its Project is still the focused one (the user may have moved on while
+   * a container was starting; the backend's focus moved with them).
+   */
   instanceOpened: (instance) => ({ type: 'instanceOpened', instance }),
   /** Focus an Instance (and the Project it belongs to). */
   instanceFocused: (instanceId) => ({ type: 'instanceFocused', instanceId }),
@@ -100,11 +104,9 @@ export function projectReducer(state, action) {
           ? p
           : { ...p, instances: [...p.instances, instance] },
       )
-      return {
-        ...next,
-        focusedProjectId: instance.project_id,
-        focusedInstanceId: instance.id,
-      }
+      return state.focusedProjectId === instance.project_id
+        ? { ...next, focusedInstanceId: instance.id }
+        : next
     }
 
     case 'instanceFocused': {
