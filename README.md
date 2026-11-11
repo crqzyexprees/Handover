@@ -193,6 +193,11 @@ HANDOVER_VERBOSE=1 RUST_LOG=info npm run dev:tauri
 | `npm run lint` | ESLint on frontend |
 | `npm test` | Frontend unit tests (Vitest) |
 
+Backend unit tests: `cd handover_rust && cargo test`. Live end-to-end checks
+against a real backend, with native shells and Docker (needs Docker, the
+`handover-base:latest` image and Python's `websockets`):
+`handover_rust/e2e/run.sh`.
+
 ## License
 
 Handover is open source under the [Apache License 2.0](LICENSE).

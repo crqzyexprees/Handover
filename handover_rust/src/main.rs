@@ -66,16 +66,39 @@ struct Cli {
     idle_exit_secs: Option<u64>,
 }
 
-/// Unix seconds of the last authenticated request (see `--idle-exit-secs`).
+/// Request activity, for `--idle-exit-secs`: when the last request ended,
+/// and how many are still running (a container can take a while to start).
 #[derive(Default)]
-struct Activity(AtomicU64);
+struct Activity {
+    last: AtomicU64,
+    in_flight: AtomicU64,
+}
 
 impl Activity {
     fn touch(&self) {
-        self.0.store(monotonic_secs() as u64, Ordering::Relaxed);
+        self.last.store(monotonic_secs() as u64, Ordering::Relaxed);
     }
+    /// Seconds with no request running; 0 while one is.
     fn idle_secs(&self) -> u64 {
-        (monotonic_secs() as u64).saturating_sub(self.0.load(Ordering::Relaxed))
+        if self.in_flight.load(Ordering::SeqCst) > 0 {
+            return 0;
+        }
+        (monotonic_secs() as u64).saturating_sub(self.last.load(Ordering::Relaxed))
+    }
+    /// Counts a request as running until the returned guard drops.
+    fn begin(self: &Arc<Self>) -> RequestGuard {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        self.touch();
+        RequestGuard(self.clone())
+    }
+}
+
+struct RequestGuard(Arc<Activity>);
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.0.touch();
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -234,9 +257,10 @@ async fn track_activity(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if req.uri().path() != "/" {
-        activity.touch();
+    if req.uri().path() == "/" {
+        return next.run(req).await;
     }
+    let _running = activity.begin();
     next.run(req).await
 }
 
@@ -1128,6 +1152,17 @@ mod tests {
             .await;
         let (_, ping) = h.call("GET", "/api/ping", Value::Null).await;
         assert_eq!(ping["busy"], 0);
+    }
+
+    #[test]
+    fn a_running_request_is_never_idle() {
+        let activity = Arc::new(Activity::default());
+        activity.last.store(0, Ordering::Relaxed);
+        let guard = activity.begin();
+        activity.last.store(0, Ordering::Relaxed); // as if it began long ago
+        assert_eq!(activity.idle_secs(), 0);
+        drop(guard);
+        assert!(activity.idle_secs() < 5);
     }
 
     #[tokio::test]
