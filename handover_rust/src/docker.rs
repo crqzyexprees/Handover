@@ -138,8 +138,8 @@ impl DockerRuntime {
         mem_limit: &str,
         custom_env_vars: &BTreeMap<String, String>,
     ) -> Result<String> {
-        let uid = users::get_current_uid();
-        let gid = users::get_current_gid();
+        let uid = uzers::get_current_uid();
+        let gid = uzers::get_current_gid();
         let mem_bytes = parse_mem_bytes(mem_limit);
         let nss_path = self._nss_dir.path();
 
@@ -283,20 +283,35 @@ impl DockerRuntime {
         Ok(())
     }
 
+    /// Freezes the container; already paused counts as success.
     pub async fn pause_container(&self, container_id: &str) -> Result<()> {
-        self.docker
-            .pause_container(container_id)
-            .await
-            .with_context(|| format!("failed to pause container {container_id}"))?;
-        Ok(())
+        if self.docker.pause_container(container_id).await.is_ok()
+            || self.is_paused(container_id).await == Some(true)
+        {
+            return Ok(());
+        }
+        anyhow::bail!("failed to pause container {container_id}")
     }
 
+    /// Unfreezes the container; running and not paused counts as success
+    /// (e.g. it was opened while its Project was being suspended).
     pub async fn resume_container(&self, container_id: &str) -> Result<()> {
+        match self.docker.unpause_container(container_id).await {
+            Ok(()) => Ok(()),
+            // Docker answers 500 "is not paused" here, so ask directly.
+            Err(_) if self.is_paused(container_id).await == Some(false) => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("failed to resume container {container_id}")),
+        }
+    }
+
+    /// Whether the container is paused; `None` if it can't be inspected.
+    async fn is_paused(&self, container_id: &str) -> Option<bool> {
         self.docker
-            .unpause_container(container_id)
+            .inspect_container(container_id, None)
             .await
-            .with_context(|| format!("failed to resume container {container_id}"))?;
-        Ok(())
+            .ok()?
+            .state?
+            .paused
     }
 
     pub async fn get_container_stats(&self, container_id: &str) -> ResourceStats {
@@ -425,9 +440,9 @@ fn build_nss_files() -> Result<TempDir> {
         .prefix(NSS_DIR_PREFIX)
         .tempdir()
         .context("tempdir failed")?;
-    let uid = users::get_current_uid();
-    let gid = users::get_current_gid();
-    let user = users::get_current_username()
+    let uid = uzers::get_current_uid();
+    let gid = uzers::get_current_gid();
+    let user = uzers::get_current_username()
         .map(|u| u.to_string_lossy().into_owned())
         .unwrap_or_else(|| "sandbox".into());
 
@@ -552,5 +567,30 @@ mod env_file_tests {
             .output()
             .unwrap();
         assert_eq!(String::from_utf8(out.stdout).unwrap(), tricky);
+    }
+}
+
+#[cfg(test)]
+mod pause_tests {
+    use super::*;
+
+    /// Needs Docker and the sandbox image: `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn pause_and_resume_are_idempotent() {
+        let rt = DockerRuntime::new().unwrap();
+        let out = std::process::Command::new("docker")
+            .args(["run", "-d", "--rm", "handover-base:latest", "sleep", "60"])
+            .output()
+            .unwrap();
+        let cid = String::from_utf8(out.stdout).unwrap().trim().to_string();
+        rt.resume_container(&cid).await.unwrap(); // not paused yet
+        rt.pause_container(&cid).await.unwrap();
+        rt.pause_container(&cid).await.unwrap(); // already paused
+        rt.resume_container(&cid).await.unwrap();
+        rt.resume_container(&cid).await.unwrap(); // already resumed
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &cid])
+            .output();
     }
 }

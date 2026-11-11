@@ -125,6 +125,9 @@ pub struct Projects {
     persist_path: PathBuf,
     /// Held across snapshot + write so saves land in order.
     save_lock: Mutex<()>,
+    /// Held while pausing or resuming containers, so a suspend and an
+    /// activate/resume never interleave and leave the state wrong.
+    pause_lock: Mutex<()>,
     sandboxes: Sandboxes,
     terminals: Arc<Terminals>,
 }
@@ -159,6 +162,7 @@ impl Projects {
             }),
             persist_path,
             save_lock: Mutex::new(()),
+            pause_lock: Mutex::new(()),
             sandboxes,
             terminals,
         })
@@ -342,6 +346,7 @@ impl Projects {
     /// Focuses the Project (the Governor never suspends it), resuming it if
     /// it was suspended.
     pub async fn activate(&self, project_id: &str) -> ProjectResult<()> {
+        let _pausing = self.pause_lock.lock().await;
         let suspended = {
             let mut inner = self.inner.write().await;
             let state = inner
@@ -365,6 +370,7 @@ impl Projects {
 
     /// Unfreezes every Instance; fails if any can't be resumed.
     pub async fn resume(&self, project_id: &str) -> ProjectResult<()> {
+        let _pausing = self.pause_lock.lock().await;
         self.project(project_id).await?;
         self.resume_instances(project_id).await?;
         self.inner
@@ -390,6 +396,7 @@ impl Projects {
 
     /// Resumes the Project if it is suspended, so prompts can be delivered.
     pub async fn ensure_active(&self, project_id: &str) -> ProjectResult<()> {
+        let _pausing = self.pause_lock.lock().await;
         if self.project(project_id).await?.state == ProjectState::Suspended {
             self.resume_instances(project_id).await?;
             self.persist_or_warn("resuming a project").await;
@@ -397,8 +404,22 @@ impl Projects {
         Ok(())
     }
 
-    /// Freezes the Project's Instances. False if nothing could be paused.
+    /// Freezes the Project's Instances. False if nothing could be paused,
+    /// or if the Project was focused (e.g. activated while the Governor
+    /// was deciding) or already suspended.
     pub async fn suspend(&self, project_id: &str) -> bool {
+        let _pausing = self.pause_lock.lock().await;
+        {
+            let inner = self.inner.read().await;
+            let Some(project) = inner.projects.get(project_id) else {
+                return false;
+            };
+            if project.state == ProjectState::Suspended
+                || inner.focused.as_deref() == Some(project_id)
+            {
+                return false;
+            }
+        }
         let mut paused = 0;
         for instance in self.instances_of(project_id).await {
             match self
@@ -814,6 +835,24 @@ mod tests {
         cfg.project_name = "  ".into();
         let saved = f.projects.configure(&p.project.id, cfg).await.unwrap();
         assert_eq!(saved.project_name, "proj");
+    }
+
+    #[tokio::test]
+    async fn a_focused_project_is_never_suspended() {
+        let f = fixture().await;
+        let p = f
+            .projects
+            .create(f.folder.clone(), SandboxMode::Docker)
+            .await
+            .unwrap();
+        f.projects.open_instance(&p.project.id, None).await.unwrap();
+        // The Governor picked it, then the user focused it before the pause.
+        f.projects.activate(&p.project.id).await.unwrap();
+        assert!(!f.projects.suspend(&p.project.id).await);
+        assert_eq!(
+            f.projects.project(&p.project.id).await.unwrap().state,
+            ProjectState::Active
+        );
     }
 
     #[tokio::test]
